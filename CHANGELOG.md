@@ -15,11 +15,20 @@ All notable changes to this project are documented here. The format follows
 - Handlers by command, message, members added and removed, conversation
   update, reaction, installation update, event name, invoke name, and
   Adaptive Card verb.
-- `TeamsClient`: send, reply, update, delete, typing, create conversation,
-  members (paged and all), team details and channels, and proactive messages
-  to a stored `ConversationReference`.
+- `TeamsClient`: send, reply, update, delete, create conversation, members
+  (paged and all), team details and channels, and proactive messages to a
+  stored `ConversationReference`. `TeamsContext` adds `reply`, `send`,
+  `typing`, `update`, and `delete` for the current conversation.
+- Handlers for `messageUpdate` and `messageDelete`.
+- Universal Action replies keep HTTP 200. An error goes in the body
+  (`InvokeResponse::card_error`).
+- `Attachment::with_preview`, `InvokeResponse::compose_message`, and
+  `Activity::is_card_submit` for message extensions and card submits.
 - Client-credentials app token for single-tenant and multi-tenant bots, with
-  cache and single flight.
-- Retry rules proven with Verus: 429 waits `Retry-After`, 5xx and network
-  errors retry only for GET, PUT, and DELETE, one token refresh on 401.
+  a cache and one request at a time. Callers that wait share the result.
+- Verus proves the retry rules: 429 and 412 wait for `Retry-After`, 5xx and
+  network errors retry only for GET, PUT, and DELETE, and a 401 gets one
+  token refresh per call.
+- The key set refreshes in the background while known keys serve. Old keys
+  serve for at most 5 days after a failed refresh.
 - `testing` feature: `TestAuthority` and inbound activity builders.

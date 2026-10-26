@@ -2,15 +2,13 @@
 
 use std::sync::{Arc, Mutex};
 
-use autumn_web::time::ClockSource;
-
-use autumn_web::time::clock_unix_secs;
+use autumn_web::time::{ClockSource, clock_unix_secs};
 use serde::Deserialize;
 
 use crate::error::TeamsError;
 use crate::metrics::TeamsMetrics;
 use crate::policy::{
-    Outcome, RetryRule, Step, TOKEN_REFRESH_MARGIN_SECS, decide, retry_after_ms, token_expires_at,
+    Outcome, RetryRule, Step, decide, retry_after_ms, token_expires_at, token_margin,
     token_needs_refresh,
 };
 use crate::transport::{HttpReply, HttpRequest, HttpTransport, Method, TransportError};
@@ -44,12 +42,26 @@ struct Cached {
     margin: u64,
 }
 
+/// The token cache and the result of the last request.
+#[derive(Default)]
+struct State {
+    cached: Option<Cached>,
+    /// Adds 1 per finished request. A waiter uses it to find a request that
+    /// ended while it waited.
+    generation: u64,
+    /// The error code of the last request, if it failed.
+    last_error: Option<String>,
+}
+
 /// The token endpoint reply.
 #[derive(Deserialize)]
 struct TokenReply {
     access_token: String,
     expires_in: Option<u64>,
 }
+
+/// Smallest token life that the cache uses.
+const MIN_TOKEN_SECS: u64 = 60;
 
 /// Gets and caches the app token. One request runs at a time.
 pub(crate) struct TokenProvider {
@@ -58,7 +70,7 @@ pub(crate) struct TokenProvider {
     clock: Arc<dyn ClockSource>,
     metrics: Arc<TeamsMetrics>,
     rule: RetryRule,
-    cache: Mutex<Option<Cached>>,
+    state: Mutex<State>,
     refresh: tokio::sync::Mutex<()>,
 }
 
@@ -84,7 +96,7 @@ impl TokenProvider {
             clock,
             metrics,
             rule,
-            cache: Mutex::new(None),
+            state: Mutex::new(State::default()),
             refresh: tokio::sync::Mutex::const_new(()),
         }
     }
@@ -94,44 +106,108 @@ impl TokenProvider {
         self.credentials.password.is_some()
     }
 
-    /// Returns a valid token: from the cache, or a new one.
-    pub(crate) async fn token(&self) -> Result<String, TeamsError> {
-        if let Some(t) = self.cached() {
-            return Ok(t);
-        }
-        // Single flight: a caller that waits here gets the new token.
-        let _turn = self.refresh.lock().await;
-        if let Some(t) = self.cached() {
-            return Ok(t);
-        }
-        let result = self.request().await;
-        self.metrics
-            .token_request(if result.is_ok() { "ok" } else { "error" });
-        let (token, expires_in) = result?;
-        let now = clock_unix_secs(self.clock.as_ref());
-        // A short-lived token keeps half its life, not the full margin.
-        let margin = TOKEN_REFRESH_MARGIN_SECS.min(expires_in / 2);
-        *self.lock() = Some(Cached {
-            token: token.clone(),
-            expires_at: token_expires_at(now, expires_in),
-            margin,
-        });
-        Ok(token)
-    }
-
-    fn lock(&self) -> std::sync::MutexGuard<'_, Option<Cached>> {
-        self.cache
+    fn lock(&self) -> std::sync::MutexGuard<'_, State> {
+        self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// The cached token, if it is not in its refresh margin.
-    fn cached(&self) -> Option<String> {
-        let now = clock_unix_secs(self.clock.as_ref());
-        self.lock()
+    fn now(&self) -> u64 {
+        clock_unix_secs(self.clock.as_ref())
+    }
+
+    /// The cached token if it is outside its margin, and the cached token if
+    /// it is not expired.
+    fn peek(&self) -> (Option<String>, Option<String>, u64) {
+        let now = self.now();
+        let st = self.lock();
+        let live = |c: &&Cached| now < c.expires_at;
+        let fresh = st
+            .cached
             .as_ref()
             .filter(|c| !token_needs_refresh(now, c.expires_at, c.margin))
-            .map(|c| c.token.clone())
+            .map(|c| c.token.clone());
+        let usable = st.cached.as_ref().filter(live).map(|c| c.token.clone());
+        (fresh, usable, st.generation)
+    }
+
+    /// Returns a valid token: from the cache, or a new one.
+    ///
+    /// - While a refresh runs, a token that is not expired serves.
+    /// - Callers that wait for a refresh share its result, also an error.
+    /// - The refresh runs in its own task: a caller that stops waiting (for
+    ///   example the health timeout) does not stop it.
+    pub(crate) async fn token(self: &Arc<Self>) -> Result<String, TeamsError> {
+        let (fresh, usable, generation) = self.peek();
+        if let Some(t) = fresh {
+            return Ok(t);
+        }
+        if let Some(t) = usable
+            && self.refresh.try_lock().is_err()
+        {
+            return Ok(t);
+        }
+        if !self.has_password() {
+            return Err(TeamsError::Config(format!(
+                "no app password; set the env var {}",
+                self.credentials.password_env
+            )));
+        }
+        let me = Arc::clone(self);
+        tokio::spawn(async move { me.refresh_after(generation).await })
+            .await
+            .unwrap_or_else(|_| {
+                Err(TeamsError::Token {
+                    code: "cancelled".to_owned(),
+                })
+            })
+    }
+
+    /// Gets a new token, unless a request ended after `generation`. Then it
+    /// gives the result of that request.
+    async fn refresh_after(&self, generation: u64) -> Result<String, TeamsError> {
+        let _turn = self.refresh.lock().await;
+        let (fresh, usable, now_generation) = self.peek();
+        if let Some(t) = fresh {
+            return Ok(t);
+        }
+        if now_generation != generation {
+            let code = self.lock().last_error.clone();
+            if let Some(code) = code {
+                return usable.ok_or(TeamsError::Token { code });
+            }
+        }
+        let result = self.request().await;
+        self.metrics
+            .token_request(if result.is_ok() { "ok" } else { "error" });
+        let now = self.now();
+        let mut st = self.lock();
+        st.generation += 1;
+        match result {
+            Ok((token, expires_in)) => {
+                let expires_in = expires_in.max(MIN_TOKEN_SECS);
+                st.cached = Some(Cached {
+                    token: token.clone(),
+                    expires_at: token_expires_at(now, expires_in),
+                    margin: token_margin(expires_in),
+                });
+                st.last_error = None;
+                Ok(token)
+            }
+            Err(e) => {
+                if let TeamsError::Token { code } = &e {
+                    st.last_error = Some(code.clone());
+                }
+                // A token that is not expired still works.
+                match st.cached.as_ref().filter(|c| now < c.expires_at) {
+                    Some(c) => {
+                        tracing::warn!(error = %e, "teams: token refresh failed; the old token serves");
+                        Ok(c.token.clone())
+                    }
+                    None => Err(e),
+                }
+            }
+        }
     }
 
     /// Requests a token. Retries 429, 5xx, and network errors: a token
@@ -178,9 +254,9 @@ impl TokenProvider {
 
     /// Drops the cached token if it is `stale`. The next call gets a new one.
     pub(crate) fn invalidate(&self, stale: &str) {
-        let mut cache = self.lock();
-        if cache.as_ref().is_some_and(|c| c.token == stale) {
-            *cache = None;
+        let mut st = self.lock();
+        if st.cached.as_ref().is_some_and(|c| c.token == stale) {
+            st.cached = None;
         }
     }
 }
@@ -193,7 +269,8 @@ pub(crate) const fn classify(result: &Result<HttpReply, TransportError>) -> (Out
     let outcome = match r.status {
         200..=299 => Outcome::Success,
         401 => Outcome::Unauthorized,
-        429 => Outcome::RateLimited,
+        // Teams asks to retry 412 like 429. The Connector did nothing.
+        412 | 429 => Outcome::RateLimited,
         500..=599 => Outcome::ServerError,
         _ => Outcome::ClientError,
     };
@@ -208,7 +285,7 @@ fn short_code(raw: &str) -> String {
         .collect()
 }
 
-/// Turns the last attempt into a token or an error. The error has a code
+/// Makes a token or an error from the last attempt. The error has a code
 /// only: `error_description` can echo input.
 fn finish(result: Result<HttpReply, TransportError>) -> Result<(String, u64), TeamsError> {
     let token_err = |code: String| TeamsError::Token { code };

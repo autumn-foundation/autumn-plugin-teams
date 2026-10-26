@@ -233,6 +233,18 @@ impl TeamsPlugin {
     }
 
     background!(
+        /// Runs `handler` for a `messageUpdate` (a user edited a message).
+        on_message_update,
+        Kind::MessageUpdate
+    );
+
+    background!(
+        /// Runs `handler` for a `messageDelete` (a user deleted a message).
+        on_message_delete,
+        Kind::MessageDelete
+    );
+
+    background!(
         /// Runs `handler` for a `conversationUpdate` with `membersAdded`.
         on_members_added,
         Kind::MembersAdded
@@ -374,8 +386,13 @@ impl TeamsPlugin {
             if password.is_none() {
                 return Err(missing("app password", &config.app_password_env));
             }
-        } else if password.is_none() {
-            tracing::warn!(env = %config.app_password_env, "teams: no app password; Connector calls fail");
+        } else {
+            if app_id.is_none() {
+                tracing::warn!(env = %config.app_id_env, "teams: no app ID; Connector calls fail");
+            }
+            if password.is_none() {
+                tracing::warn!(env = %config.app_password_env, "teams: no app password; Connector calls fail");
+            }
         }
         let app_id = app_id.unwrap_or_default();
         let transport: Arc<dyn HttpTransport> = match self.transport {
@@ -426,6 +443,7 @@ impl TeamsPlugin {
             },
             keys,
             Arc::clone(&self.metrics),
+            Arc::clone(&clock),
         );
         tracing::info!(
             base_path = %self.base_path,

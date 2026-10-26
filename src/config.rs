@@ -27,6 +27,10 @@ pub const ENV_PREFIX: &str = "AUTUMN_TEAMS__";
 /// Teams waits 5 s for an invoke reply, network time included. The invoke
 /// timeout keeps 500 ms or more for the network.
 pub const MAX_INVOKE_TIMEOUT_MS: u64 = 4_500;
+/// Largest `max_body_bytes`. Bot Framework activities are small.
+pub const MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
+/// Largest `api.max_wait_ms` and `api.initial_backoff_ms`.
+pub const MAX_WAIT_MS: u64 = 60_000;
 /// The tenant for a multi-tenant bot token.
 pub const MULTI_TENANT: &str = "botframework.com";
 
@@ -61,9 +65,9 @@ pub struct TeamsConfig {
     /// Time to wait for an invoke handler before an empty 200,
     /// 1 to 4500 ms.
     pub invoke_timeout_ms: u64,
-    /// Largest request body.
+    /// Largest request body, 1 to 4 MiB.
     pub max_body_bytes: usize,
-    /// Time to remember an activity ID, to drop retries.
+    /// Time to remember an activity ID, to drop retries. 1 s or more.
     pub dedup_window_secs: u64,
     /// Time to wait for running handlers at shutdown.
     pub drain_timeout_secs: u64,
@@ -111,7 +115,8 @@ impl Default for TeamsConfig {
 pub struct KeysConfig {
     /// Time to keep the key set, 60 to 86400 s.
     pub cache_secs: u64,
-    /// Smallest time between two refreshes for an unknown `kid`, 1 to 3600 s.
+    /// Smallest time between two refreshes for an unknown `kid`, and after a
+    /// failed refresh, 1 to 3600 s.
     pub min_refresh_secs: u64,
 }
 
@@ -119,7 +124,7 @@ impl Default for KeysConfig {
     fn default() -> Self {
         Self {
             cache_secs: MAX_KEY_AGE_SECS,
-            min_refresh_secs: 300,
+            min_refresh_secs: 60,
         }
     }
 }
@@ -131,9 +136,10 @@ impl Default for KeysConfig {
 pub struct ApiConfig {
     /// Attempts per call, 1 to 10.
     pub max_attempts: u32,
-    /// First backoff for 5xx and network errors.
+    /// First backoff for 5xx and network errors, 60000 ms or less.
     pub initial_backoff_ms: u64,
-    /// Largest wait before a retry. A longer `Retry-After` stops the call.
+    /// Largest wait before a retry, 60000 ms or less. A longer `Retry-After`
+    /// stops the call.
     pub max_wait_ms: u64,
     /// Time limit for one HTTP attempt.
     pub timeout_ms: u64,
@@ -337,8 +343,22 @@ impl TeamsConfig {
                 self.invoke_timeout_ms
             ));
         }
-        if self.max_body_bytes == 0 {
-            return bad("max_body_bytes must be 1 or more".to_owned());
+        if !(1..=MAX_BODY_BYTES).contains(&self.max_body_bytes) {
+            return bad(format!(
+                "max_body_bytes must be 1 to {MAX_BODY_BYTES}, not {}",
+                self.max_body_bytes
+            ));
+        }
+        if self.dedup_window_secs == 0 {
+            return bad("dedup_window_secs must be 1 or more".to_owned());
+        }
+        for (name, value) in [
+            ("api.max_wait_ms", self.api.max_wait_ms),
+            ("api.initial_backoff_ms", self.api.initial_backoff_ms),
+        ] {
+            if value > MAX_WAIT_MS {
+                return bad(format!("{name} must be {MAX_WAIT_MS} or less, not {value}"));
+            }
         }
         if !(60..=MAX_KEY_AGE_SECS).contains(&self.keys.cache_secs) {
             return bad(format!(
@@ -510,6 +530,8 @@ mod tests {
     #[test]
     fn defaults_are_valid() {
         TeamsConfig::default().validate().unwrap();
+        // An unknown `kid` can force a refresh once a minute.
+        assert_eq!(TeamsConfig::default().keys.min_refresh_secs, 60);
         assert_eq!(
             TeamsConfig::from_toml_str("").unwrap(),
             TeamsConfig::default()
@@ -594,6 +616,10 @@ mod tests {
         assert!(check(|c| c.allowed_channels.clear()).contains("allowed_channels"));
         assert!(check(|c| c.allowed_tenants = vec![String::new()]).contains("allowed_tenants"));
         assert!(check(|c| c.max_body_bytes = 0).contains("max_body_bytes"));
+        assert!(check(|c| c.max_body_bytes = 4_194_305).contains("max_body_bytes"));
+        assert!(check(|c| c.dedup_window_secs = 0).contains("dedup_window_secs"));
+        assert!(check(|c| c.api.max_wait_ms = 60_001).contains("api.max_wait_ms"));
+        assert!(check(|c| c.api.initial_backoff_ms = 60_001).contains("api.initial_backoff_ms"));
         assert!(check(|c| c.app_id_env.clear()).contains("app_id_env"));
         assert!(check(|c| c.app_password_env.clear()).contains("app_password_env"));
         assert!(check(|c| c.tenant_id_env.clear()).contains("tenant_id_env"));

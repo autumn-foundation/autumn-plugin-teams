@@ -101,6 +101,13 @@ impl TeamsClient {
             url.push('/');
             url.push_str(&encode_segment(seg));
         }
+        // Check the parsed URL again, and send the parsed form. So a
+        // transport with another URL parser sees the same host.
+        let parsed = url::Url::parse(&url).map_err(|_| TeamsError::BadServiceUrl)?;
+        if !allowed_service_url(parsed.as_str(), &self.inner.config.service_url_hosts) {
+            return Err(TeamsError::BadServiceUrl);
+        }
+        let mut url = parsed.to_string();
         if !query.is_empty() {
             url.push('?');
             url.push_str(
@@ -173,7 +180,7 @@ impl TeamsClient {
         }
     }
 
-    /// Turns the last attempt into a result. Counts it.
+    /// Makes a result from the last attempt. Counts it.
     fn finish(
         &self,
         operation: &'static str,
@@ -371,7 +378,9 @@ impl TeamsClient {
         .await
     }
 
-    /// `GET /v3/conversations/{id}/members`.
+    /// `GET /v3/conversations/{id}/members`. Use it for chats only.
+    /// Microsoft throttles it for teams and channels: use
+    /// [`Self::all_members`] there.
     ///
     /// # Errors
     /// Same as [`Self::call`].
@@ -391,7 +400,9 @@ impl TeamsClient {
         .await
     }
 
-    /// `GET /v3/conversations/{id}/pagedmembers`: one page.
+    /// `GET /v3/conversations/{id}/pagedmembers`: one page. The Connector
+    /// accepts a page size of 50 to 500, so the client clamps `page_size`.
+    /// A chat gives all members on one page.
     ///
     /// # Errors
     /// Same as [`Self::call`].
@@ -402,7 +413,7 @@ impl TeamsClient {
         page_size: Option<u32>,
         continuation_token: Option<&str>,
     ) -> Result<PagedMembers, TeamsError> {
-        let size = page_size.map(|n| n.to_string());
+        let size = page_size.map(|n| n.clamp(50, 500).to_string());
         let mut query = Vec::new();
         if let Some(n) = &size {
             query.push(("pageSize", n.as_str()));
@@ -568,8 +579,8 @@ fn outgoing(
     serde_json::to_value(&a).map_err(|e| TeamsError::Config(format!("activity: {e}")))
 }
 
-/// Percent-encodes one path segment. Only unreserved characters stay, like
-/// `encodeURIComponent` in the Bot Framework SDK.
+/// Percent-encodes one path segment. Only unreserved characters stay. This
+/// is a little stricter than `encodeURIComponent` in the Bot Framework SDK.
 fn encode_segment(seg: &str) -> String {
     let mut out = String::with_capacity(seg.len());
     for b in seg.bytes() {

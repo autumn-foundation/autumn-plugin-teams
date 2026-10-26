@@ -143,6 +143,8 @@ where
 pub(crate) enum Kind {
     Message,
     Command,
+    MessageUpdate,
+    MessageDelete,
     MembersAdded,
     MembersRemoved,
     ConversationUpdate,
@@ -158,6 +160,8 @@ impl Kind {
         match self {
             Self::Message => "message",
             Self::Command => "command",
+            Self::MessageUpdate => "message_update",
+            Self::MessageDelete => "message_delete",
             Self::MembersAdded => "members_added",
             Self::MembersRemoved => "members_removed",
             Self::ConversationUpdate => "conversation_update",

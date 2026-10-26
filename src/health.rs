@@ -15,7 +15,8 @@ use crate::error::TeamsError;
 /// Time limit for one check. 1.5 s is less than the 2 s autumn indicator
 /// timeout.
 const CHECK_TIMEOUT: Duration = Duration::from_millis(1_500);
-/// Largest time to keep a `Down` result. A short outage clears fast.
+/// Largest time to keep a `Down` result. After a short outage, a new check
+/// runs soon.
 pub const DOWN_TTL: Duration = Duration::from_secs(5);
 
 /// A stored result and its expiry.

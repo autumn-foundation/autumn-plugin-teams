@@ -5,7 +5,7 @@ use std::sync::{Arc, OnceLock};
 use autumn_web::openapi::ApiDoc;
 use autumn_web::reexports::axum::{
     Router,
-    body::{Body, to_bytes},
+    body::Body,
     http::{HeaderMap, HeaderValue, Method, StatusCode, header::CONTENT_TYPE},
     response::Response,
     routing::{MethodRouter, post},
@@ -85,12 +85,7 @@ async fn dispatch(cell: &EngineCell, headers: HeaderMap, body: Body) -> Response
         engine.metrics.request("shutting_down");
         return status(StatusCode::SERVICE_UNAVAILABLE);
     }
-    // Read at most `max_body_bytes`.
-    let Ok(bytes) = to_bytes(body, engine.config.max_body_bytes).await else {
-        engine.metrics.request("too_large");
-        return status(StatusCode::PAYLOAD_TOO_LARGE);
-    };
-    engine.messages(&headers, bytes).await
+    Arc::clone(engine).messages(&headers, body).await
 }
 
 /// A status with no body.

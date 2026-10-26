@@ -6,10 +6,14 @@
 ## Context
 
 The Bot Connector sends each activity with `Authorization: Bearer <JWT>`.
-Microsoft lists the checks: issuer `https://api.botframework.com`, audience =
-app ID, time window with 5 min skew, a key from the Bot Framework OpenID key
-set, the key endorsement for the activity `channelId`, and a `serviceurl`
-claim equal to the activity `serviceUrl`.
+Microsoft lists these checks:
+
+- The issuer is `https://api.botframework.com`.
+- The audience is the app ID.
+- The JWT is in its time window, with 5 min skew.
+- A key from the Bot Framework `OpenID` key set signs it.
+- The key endorses the activity `channelId`.
+- The `serviceurl` claim equals the activity `serviceUrl`.
 
 autumn-web 0.8 has an OIDC ID token check in `auth.rs`. It is private. It
 checks a nonce and other ID token claims. It fetches the key set for each
@@ -31,16 +35,23 @@ Option 3.
 - No new crypto backend in the dependency tree.
 - The plugin checks the time window with the autumn `ClockSource`, through
   the verified `policy::token_time_valid`. Tests use a fixed clock.
-- The key cache rules are in the verified core: refresh at least every 24 h
-  (`keys_fresh`), and at most one load per `min_refresh_secs` for an unknown
-  `kid` (`may_refresh_keys`). Unknown `kid` values cannot flood the key
-  endpoint.
+- The verified core holds the key cache rules. `keys_fresh` makes the
+  plugin refresh the keys every 24 h or sooner. `may_refresh_keys` allows one
+  refresh per `min_refresh_secs` for an unknown `kid`. So unknown `kid`
+  values cannot flood the key endpoint.
+- A known `kid` serves from the old set while one background task refreshes.
+  A refresh never blocks a request that has a known key.
+- After a failed refresh, the old keys serve for 5 days at most
+  (`MAX_STALE_KEY_AGE_SECS`). Then the route replies 503.
 - RS256 is fixed in code. The token header cannot pick `none` or HS256.
 
 ## Results
 
-- Good: the check runs before the body parse. The activity check runs before
-  any handler.
+- Good: the JWT check runs before the body is read. The activity check runs
+  before any handler.
+- Bad: an attacker can use up the unknown-`kid` refresh just before Microsoft
+  starts to use a new key. Real activities can then get 401 for up to
+  `min_refresh_secs` (default 60 s).
 - Good: `TestAuthority` signs tokens with a test key, so app tests need no
   Microsoft account.
 - Bad: two JWT checks exist in an app that also uses autumn OIDC.
@@ -56,9 +67,9 @@ Option 3.
   Connector sends JSON.
 - **Start in a state initializer**, so a `#[job]` gets the client. A startup
   hook reports a start error.
-- **Status codes:** 401 for a bad token, 403 for a valid token that does not
+- **Status codes:** 401 for a bad JWT, 403 for a valid JWT that does not
   match the activity, 503 when no key set can be loaded (the Connector can
-  retry).
+  send the activity again).
 
 ## Upstream seams (proposed)
 

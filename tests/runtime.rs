@@ -256,9 +256,11 @@ async fn keys_are_cached_and_refreshed_after_the_max_age() {
     clock.advance(Duration::from_secs(86_400));
     a.id = Some("k-late".into());
     let at = now_secs() + 86_400;
+    // A stale set still serves a known kid. One refresh runs in the background.
     assert_eq!(send_as(&rt, &authority(), &a, at).await, 200);
+    let m = rt.metrics();
+    wait_until(Duration::from_secs(5), &|| m.key_refreshes("ok") == 2).await;
     assert_eq!(keys.loads.load(Ordering::SeqCst), 2);
-    assert_eq!(rt.metrics().key_refreshes("ok"), 2);
 }
 
 #[tokio::test]
@@ -273,27 +275,24 @@ async fn unknown_kid_refreshes_at_most_once_per_interval() {
         .unwrap();
     let a = message("x");
     let unknown = TestAuthority::new(APP_ID).with_kid("rotated");
-    // An attacker floods unknown kids: one load for the first, none after.
+    // An attacker floods unknown kids. The first load also uses up the
+    // budget for unknown kids, so no more loads follow.
     for _ in 0..5 {
         assert_eq!(send_as(&rt, &unknown, &a, now_secs()).await, 401);
     }
-    assert_eq!(
-        keys.loads.load(Ordering::SeqCst),
-        2,
-        "first load + one refresh"
-    );
-    // Microsoft adds the key. After min_refresh_secs, the next unknown kid
-    // refreshes and passes.
+    assert_eq!(keys.loads.load(Ordering::SeqCst), 1);
+    // Microsoft adds the key. After min_refresh_secs (60 s), the next
+    // unknown kid refreshes and passes.
     keys.keys.lock().unwrap().clone_from(&KeySet::new(vec![
         authority().signing_key(),
         unknown.signing_key(),
     ]));
-    clock.advance(Duration::from_secs(299));
-    assert_eq!(send_as(&rt, &unknown, &a, now_secs() + 299).await, 401);
-    assert_eq!(keys.loads.load(Ordering::SeqCst), 2);
+    clock.advance(Duration::from_secs(59));
+    assert_eq!(send_as(&rt, &unknown, &a, now_secs() + 59).await, 401);
+    assert_eq!(keys.loads.load(Ordering::SeqCst), 1);
     clock.advance(Duration::from_secs(1));
-    assert_eq!(send_as(&rt, &unknown, &a, now_secs() + 300).await, 200);
-    assert_eq!(keys.loads.load(Ordering::SeqCst), 3);
+    assert_eq!(send_as(&rt, &unknown, &a, now_secs() + 60).await, 200);
+    assert_eq!(keys.loads.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]
@@ -316,7 +315,8 @@ async fn failed_refresh_keeps_the_old_keys() {
         send_as(&rt, &authority(), &a, now_secs() + 86_400).await,
         200
     );
-    assert_eq!(rt.metrics().key_refreshes("error"), 1);
+    let m = rt.metrics();
+    wait_until(Duration::from_secs(5), &|| m.key_refreshes("error") == 1).await;
     // No keys at all: 503, so the Connector retries.
     let empty = CountingKeys::new(KeySet::default());
     empty.fail.store(true, Ordering::SeqCst);

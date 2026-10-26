@@ -127,3 +127,26 @@ async fn real_http_round_trip_with_token_keys_and_429_retry() {
         .unwrap_err();
     assert!(matches!(e, TeamsError::Transport(_)), "{e:?}");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_huge_reply_body_is_refused() {
+    let big = "x".repeat(autumn_plugin_teams::transport::MAX_REPLY_BYTES + 1);
+    let ok = "y".repeat(1_000);
+    let base = serve(
+        Router::new()
+            .route("/big", get(move || async move { big }))
+            .route("/ok", get(move || async move { ok })),
+    )
+    .await;
+    let t = ReqwestTransport::new(Duration::from_secs(5)).unwrap();
+    let e = t
+        .send(HttpRequest::new(Method::Get, format!("{base}big")))
+        .await
+        .unwrap_err();
+    assert!(e.0.contains("too large"), "{e:?}");
+    let r = t
+        .send(HttpRequest::new(Method::Get, format!("{base}ok")))
+        .await
+        .unwrap();
+    assert_eq!(r.body.len(), 1_000);
+}

@@ -1,6 +1,6 @@
 //! Verus spec and proof for `src/policy.rs`.
 //!
-//! Keep this file in step with `src/policy.rs`.
+//! Make the same change in this file and in `src/policy.rs`.
 //! Run: `verus verus/policy.rs`.
 
 use vstd::prelude::*;
@@ -17,6 +17,8 @@ pub const TOKEN_REFRESH_MARGIN_SECS: u64 = 300;
 pub const MAX_ATTEMPTS: u32 = 10;
 /// Wait for a 429 with no `Retry-After` header.
 pub const DEFAULT_RETRY_AFTER_MS: u64 = 1_000;
+/// After a failed refresh, use old keys for at most 5 days.
+pub const MAX_STALE_KEY_AGE_SECS: u64 = 432_000;
 
 // --------------------------------------------------------- token time window
 
@@ -119,6 +121,27 @@ pub fn token_expires_at(now: u64, expires_in: u64) -> (r: u64)
     }
 }
 
+/// Spec: the refresh margin is 5 min, or half the token life if that is
+/// shorter.
+pub open spec fn spec_margin(expires_in: int) -> int {
+    spec_min(expires_in / 2, TOKEN_REFRESH_MARGIN_SECS as int)
+}
+
+/// Returns the refresh margin for a token that lives `expires_in` seconds.
+pub fn token_margin(expires_in: u64) -> (r: u64)
+    ensures
+        r == spec_margin(expires_in as int),
+        r <= TOKEN_REFRESH_MARGIN_SECS,
+        r <= expires_in / 2,
+{
+    let half = expires_in / 2;
+    if half < TOKEN_REFRESH_MARGIN_SECS {
+        half
+    } else {
+        TOKEN_REFRESH_MARGIN_SECS
+    }
+}
+
 // ------------------------------------------------------------- inbound keys
 
 /// Spec: the key set is younger than `max_age`. A key set from the future
@@ -142,6 +165,15 @@ proof fn lemma_fresh_keys_are_young(now: int, fetched_at: int, max_age: int)
         spec_keys_fresh(now, fetched_at, max_age),
     ensures
         now - fetched_at < MAX_KEY_AGE_SECS as int,
+{
+}
+
+/// Old keys after a failed refresh are less than 5 days old.
+proof fn lemma_stale_keys_are_bounded(now: int, fetched_at: int)
+    requires
+        spec_keys_fresh(now, fetched_at, MAX_STALE_KEY_AGE_SECS as int),
+    ensures
+        now - fetched_at < MAX_STALE_KEY_AGE_SECS as int,
 {
 }
 
@@ -425,15 +457,91 @@ pub fn retry_after_ms(secs: u64) -> (r: u64)
 }
 
 /// One step of the client loop: a retry at `attempt < max` gives a next
-/// attempt that is still `<= max`. The loop itself (start at 1, add 1 per
-/// retry, set `token_refreshed` after a refresh) is in `src/client.rs`.
-/// Tests check it.
+/// attempt that is still `<= max`.
 proof fn lemma_attempts_bounded(attempt: u32, max_attempts: u32)
     requires
         attempt < max_attempts,
     ensures
         attempt + 1 <= max_attempts,
 {
+}
+
+// ------------------------------------------------------- client loop model
+
+/// The outcome for a reply code in the loop model: 0 success, 1 401, 2 429,
+/// 3 5xx, 4 network error, other codes a client error.
+pub fn outcome_of(code: u8) -> (o: Outcome)
+    ensures
+        (code == 3 || code == 4) <==> (o is ServerError || o is NetworkError),
+{
+    if code == 0 {
+        Outcome::Success
+    } else if code == 1 {
+        Outcome::Unauthorized
+    } else if code == 2 {
+        Outcome::RateLimited
+    } else if code == 3 {
+        Outcome::ServerError
+    } else if code == 4 {
+        Outcome::NetworkError
+    } else {
+        Outcome::ClientError
+    }
+}
+
+/// Model of the retry loop in `src/client.rs`: start at attempt 1, call
+/// `decide`, add 1 per retry, and set `token_refreshed` after a refresh.
+/// `replies[i]` is the reply code of attempt `i + 1`.
+///
+/// Returns the last attempt, the number of token refreshes, and the number
+/// of retries after a 5xx or a network error. Over the whole call: attempts
+/// are bounded, the token refresh happens one time or less, and a call that
+/// is not idempotent never repeats after a 5xx or a network error.
+pub fn retry_loop_model(replies: &Vec<u8>, idempotent: bool, rule: &RetryRule) -> (r: (
+    u32,
+    u32,
+    u32,
+))
+    requires
+        1 <= rule.max_attempts,
+        replies.len() >= rule.max_attempts as int,
+    ensures
+        1 <= r.0 <= rule.max_attempts,
+        r.1 <= 1,
+        !idempotent ==> r.2 == 0,
+{
+    let mut attempt: u32 = 1;
+    let mut refreshed: bool = false;
+    let mut refreshes: u32 = 0;
+    let mut unsafe_retries: u32 = 0;
+    loop
+        invariant
+            1 <= attempt <= rule.max_attempts,
+            replies.len() >= rule.max_attempts as int,
+            refreshes <= 1,
+            refreshed == (refreshes == 1),
+            unsafe_retries < attempt,
+            !idempotent ==> unsafe_retries == 0,
+        decreases rule.max_attempts - attempt,
+    {
+        let code = replies[(attempt - 1) as usize];
+        let step = decide(outcome_of(code), attempt, idempotent, None, refreshed, rule);
+        match step {
+            Step::Retry(_) => {
+                if code == 3 || code == 4 {
+                    unsafe_retries = unsafe_retries + 1;
+                }
+            },
+            Step::RefreshToken => {
+                refreshed = true;
+                refreshes = refreshes + 1;
+            },
+            _ => {
+                return (attempt, refreshes, unsafe_retries);
+            },
+        }
+        attempt = attempt + 1;
+    }
 }
 
 fn main() {

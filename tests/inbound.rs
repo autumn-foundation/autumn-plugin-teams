@@ -602,10 +602,11 @@ async fn card_action_replies_by_verb() {
     assert_eq!(v["statusCode"], 200);
     assert_eq!(v["type"], "application/vnd.microsoft.activity.message");
     assert_eq!(v["value"], "approved 7");
-    // Another verb has no handler.
-    let mut other = testing::card_action("reject", json!({}));
-    other.id = Some("2".into());
-    post(&client, &other).await.assert_status(501);
+    // Another verb has no handler: HTTP 200 with a 400 error body.
+    let other = testing::card_action("reject", json!({}));
+    let r = post(&client, &other).await;
+    r.assert_status(200);
+    assert_eq!(r.json::<Value>()["statusCode"], 400);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -684,8 +685,10 @@ async fn invoke_error_or_panic_gives_500_with_no_detail() {
     assert!(!r.text().contains("secret"), "{}", r.text());
     let mut b = testing::card_action("boom", json!({}));
     b.id = Some("b".into());
+    // A card action error keeps HTTP 200, with the error in the body.
     let r = post(&client, &b).await;
-    r.assert_status(500);
+    r.assert_status(200);
+    assert_eq!(r.json::<Value>()["statusCode"], 500);
     assert!(!r.text().contains("boom"), "{}", r.text());
 }
 

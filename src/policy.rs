@@ -1,6 +1,6 @@
 //! Pure policy core. Verified with Verus in `verus/policy.rs`.
 //!
-//! Keep this file and the Verus file in step.
+//! Make the same change in this file and in `verus/policy.rs`.
 
 /// Bot Framework clock skew: 5 minutes.
 pub const DEFAULT_CLOCK_SKEW_SECS: u64 = 300;
@@ -12,6 +12,8 @@ pub const TOKEN_REFRESH_MARGIN_SECS: u64 = 300;
 pub const MAX_ATTEMPTS: u32 = 10;
 /// Wait for a 429 with no `Retry-After` header.
 pub const DEFAULT_RETRY_AFTER_MS: u64 = 1_000;
+/// After a failed refresh, use old keys for at most 5 days.
+pub const MAX_STALE_KEY_AGE_SECS: u64 = 432_000;
 
 /// Returns `true` when a token with `exp` and `nbf` is valid at `now`.
 #[must_use]
@@ -29,6 +31,18 @@ pub const fn token_time_valid(now: u64, nbf: Option<u64>, exp: u64, skew: u64) -
 #[must_use]
 pub const fn token_needs_refresh(now: u64, expires_at: u64, margin: u64) -> bool {
     expires_at <= now || expires_at - now <= margin
+}
+
+/// Returns the refresh margin for a token that lives `expires_in` seconds:
+/// 5 min, or half the token life if that is shorter.
+#[must_use]
+pub const fn token_margin(expires_in: u64) -> u64 {
+    let half = expires_in / 2;
+    if half < TOKEN_REFRESH_MARGIN_SECS {
+        half
+    } else {
+        TOKEN_REFRESH_MARGIN_SECS
+    }
 }
 
 /// Returns `now + expires_in`. It saturates.
@@ -189,30 +203,33 @@ mod tests {
         max_wait_ms: 1_000,
     };
 
+    const SPEC: &str = include_str!("../verus/policy.rs");
+
+    /// This file without its test module, so test text cannot match itself.
+    fn code() -> &'static str {
+        let src = include_str!("policy.rs");
+        &src[..src.find("#[cfg(test)]").unwrap()]
+    }
+
     #[test]
-    fn verus_constants_match() {
-        let spec = include_str!("../verus/policy.rs");
-        for line in [
-            "pub const DEFAULT_CLOCK_SKEW_SECS: u64 = 300;",
-            "pub const MAX_KEY_AGE_SECS: u64 = 86_400;",
-            "pub const TOKEN_REFRESH_MARGIN_SECS: u64 = 300;",
-            "pub const MAX_ATTEMPTS: u32 = 10;",
-            "pub const DEFAULT_RETRY_AFTER_MS: u64 = 1_000;",
-        ] {
-            assert!(spec.contains(line), "verus/policy.rs lacks {line}");
+    fn constants_match_the_spec() {
+        assert_eq!(DEFAULT_CLOCK_SKEW_SECS, 300);
+        assert_eq!(MAX_KEY_AGE_SECS, 86_400);
+        assert_eq!(MAX_STALE_KEY_AGE_SECS, 432_000);
+        assert_eq!(TOKEN_REFRESH_MARGIN_SECS, 300);
+        assert_eq!(MAX_ATTEMPTS, 10);
+        assert_eq!(DEFAULT_RETRY_AFTER_MS, 1_000);
+        for line in code()
+            .lines()
+            .filter(|l| l.starts_with("pub const ") && !l.starts_with("pub const fn"))
+        {
+            assert!(SPEC.contains(line), "verus/policy.rs lacks {line}");
         }
     }
 
-    /// The `{ ... }` block that starts at the last `start` before `anchor`,
-    /// with no whitespace and no optional comma near `}` or `)`.
-    fn block(src: &str, start: &str, anchor: &str) -> String {
-        let at = src.find(anchor).unwrap_or_else(|| panic!("no {anchor}"));
-        let from = src[..at + anchor.len()]
-            .rfind(start)
-            .unwrap_or_else(|| panic!("no {start}"));
-        let open = from + src[from..].find('{').unwrap();
+    /// The balanced `{ ... }` block that starts at byte `open`.
+    fn balanced(src: &str, open: usize) -> &str {
         let mut depth = 0;
-        let mut end = open;
         for (i, c) in src[open..].char_indices() {
             match c {
                 '{' => depth += 1,
@@ -220,69 +237,96 @@ mod tests {
                 _ => {}
             }
             if depth == 0 {
-                end = open + i;
-                break;
+                return &src[open..=open + i];
             }
         }
-        let flat: String = src[open..=end]
+        panic!("unbalanced block");
+    }
+
+    /// The body of `fn name`: the first `{` outside parentheses after the
+    /// name. Spec-only parts (proof blocks, loop invariants, asserts, and
+    /// comments) are removed, and so is all whitespace.
+    fn body(src: &str, name: &str) -> String {
+        let at = src
+            .find(&format!("fn {name}("))
+            .unwrap_or_else(|| panic!("no fn {name}"));
+        let mut parens = 0i32;
+        let open = src[at..]
+            .char_indices()
+            .find_map(|(i, c)| {
+                match c {
+                    '(' => parens += 1,
+                    ')' => parens -= 1,
+                    '{' if parens == 0 => return Some(at + i),
+                    _ => {}
+                }
+                None
+            })
+            .unwrap();
+        let mut text = balanced(src, open).to_owned();
+        while let Some(p) = text.find("proof {") {
+            let block = balanced(&text, p + "proof ".len()).len();
+            text.replace_range(p..p + "proof ".len() + block, "");
+        }
+        while let Some(p) = text.find("invariant") {
+            let end = p + text[p..].find("decreases").unwrap();
+            let end = end + text[end..].find('{').unwrap();
+            text.replace_range(p..end, "");
+        }
+        while let Some(p) = text.find("assert(") {
+            let end = p + text[p..].find(");").unwrap() + 2;
+            text.replace_range(p..end, "");
+        }
+        let text: String = text
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or_default())
+            .collect::<String>()
             .chars()
             .filter(|c| !c.is_whitespace())
             .collect();
-        flat.replace(",}", "}")
+        text.replace(",}", "}")
             .replace(",)", ")")
             .replace("},", "}")
-    }
-
-    /// The text from `anchor` to the end of its line, with no whitespace.
-    fn line(src: &str, anchor: &str) -> String {
-        let at = src.find(anchor).unwrap_or_else(|| panic!("no {anchor}"));
-        src[at..]
-            .lines()
-            .next()
-            .unwrap_or_default()
-            .chars()
-            .filter(|c| !c.is_whitespace())
-            .collect()
+            .replace(":u64=", "=")
+            .replace(":u32=", "=")
+            .replace("i=i+1;", "i+=1;")
     }
 
     #[test]
     fn verus_bodies_match() {
-        let spec = include_str!("../verus/policy.rs");
-        let code = include_str!("policy.rs");
-        // Bodies with no proof code: the text must match.
-        for (start, anchor) in [
-            (
-                "match outcome {",
-                "Outcome::Success | Outcome::ClientError => Step::Done",
-            ),
-            (
-                "if secs <= u64::MAX / 1000 {",
-                "if secs <= u64::MAX / 1000 {",
-            ),
-            (
-                "if expires_in <= u64::MAX - now {",
-                "if expires_in <= u64::MAX - now {",
-            ),
-            ("let nbf_ok = match nbf {", "let nbf_ok = match nbf {"),
-            (
-                "match last_attempt {",
-                "Some(t) => now < t || now - t >= min_interval,",
-            ),
+        for name in [
+            "token_time_valid",
+            "token_needs_refresh",
+            "token_margin",
+            "token_expires_at",
+            "keys_fresh",
+            "may_refresh_keys",
+            "backoff_ms",
+            "decide",
+            "retry_after_ms",
         ] {
-            assert_eq!(
-                block(spec, start, anchor),
-                block(code, start, anchor),
-                "{start}"
-            );
+            assert_eq!(body(SPEC, name), body(code(), name), "fn {name}");
         }
-        for anchor in [
-            "let exp_ok = ",
-            "expires_at <= now || expires_at - now <= margin",
-            "fetched_at <= now && now - fetched_at < max_age",
-            "b = if cap - b <= b { cap } else { b * 2 };",
-        ] {
-            assert_eq!(line(spec, anchor), line(code, anchor), "{anchor}");
-        }
+    }
+
+    #[test]
+    fn drift_check_sees_changes() {
+        // The check must see a change in an `else` branch and in a loop.
+        let changed = code().replace("u64::MAX\n    }\n}", "0\n    }\n}");
+        assert_ne!(
+            body(&changed, "retry_after_ms"),
+            body(SPEC, "retry_after_ms")
+        );
+        let changed = code().replace("i += 1;", "i += 2;");
+        assert_ne!(body(&changed, "backoff_ms"), body(SPEC, "backoff_ms"));
+    }
+
+    #[test]
+    fn margin_edges() {
+        assert_eq!(token_margin(3_600), 300);
+        assert_eq!(token_margin(400), 200);
+        assert_eq!(token_margin(1), 0);
+        assert_eq!(token_margin(u64::MAX), 300);
     }
 
     #[test]

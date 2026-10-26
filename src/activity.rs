@@ -10,6 +10,10 @@ use serde_json::{Map, Value, json};
 pub mod types {
     /// A user message.
     pub const MESSAGE: &str = "message";
+    /// A user edited a message.
+    pub const MESSAGE_UPDATE: &str = "messageUpdate";
+    /// A user deleted a message.
+    pub const MESSAGE_DELETE: &str = "messageDelete";
     /// Members or conversation properties changed.
     pub const CONVERSATION_UPDATE: &str = "conversationUpdate";
     /// A user added or removed a reaction.
@@ -45,6 +49,9 @@ pub struct ChannelAccount {
     /// `user` or `bot`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
+    /// Other fields.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 impl ChannelAccount {
@@ -78,6 +85,9 @@ pub struct ConversationAccount {
     /// `true` for a group chat or a channel.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub is_group: Option<bool>,
+    /// Other fields.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 impl ConversationAccount {
@@ -107,6 +117,12 @@ pub struct Attachment {
     /// File name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// Preview card, for a message extension result.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<Box<Self>>,
+    /// Other fields.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 impl Attachment {
@@ -118,6 +134,13 @@ impl Attachment {
             content: Some(card),
             ..Self::default()
         }
+    }
+
+    /// Sets the preview card of a message extension result.
+    #[must_use]
+    pub fn with_preview(mut self, preview: Self) -> Self {
+        self.preview = Some(Box::new(preview));
+        self
     }
 
     /// An attachment with this content type and content.
@@ -199,7 +222,8 @@ pub struct Activity {
     /// Name of an invoke or an event.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    /// `add` or `remove`, for `installationUpdate`.
+    /// `add`, `remove`, `add-upgrade`, or `remove-upgrade`, for
+    /// `installationUpdate`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub action: Option<String>,
     /// Members added, for `conversationUpdate`.
@@ -261,7 +285,7 @@ impl Activity {
     #[must_use]
     pub fn with_mention(mut self, account: &ChannelAccount) -> Self {
         let name = account.name.as_deref().unwrap_or(&account.id);
-        let tag = format!("<at>{name}</at>");
+        let tag = format!("<at>{}</at>", xml_escape(name));
         self.text = Some(
             self.text
                 .take()
@@ -298,11 +322,49 @@ impl Activity {
         out.trim().to_owned()
     }
 
-    /// The first word of [`Self::text_without_mentions`], in lower case and
-    /// with no leading `/`, and the rest of the text.
+    /// The text without the mention of the bot (the recipient), trimmed.
+    /// Other mentions stay. With no mention entity, only a leading
+    /// `<at>...</at>` is removed.
+    #[must_use]
+    pub fn text_without_bot_mention(&self) -> String {
+        let text = self.text.as_deref().unwrap_or_default();
+        let bot = self.recipient.as_ref().map(|r| r.id.as_str());
+        let tags: Vec<&str> = self
+            .entities
+            .iter()
+            .filter(|e| e.get("type").and_then(Value::as_str) == Some("mention"))
+            .filter(|e| e.pointer("/mentioned/id").and_then(Value::as_str) == bot)
+            .filter_map(|e| e.get("text").and_then(Value::as_str))
+            .collect();
+        if bot.is_some() && !tags.is_empty() {
+            let mut out = text.to_owned();
+            for tag in tags {
+                out = out.replace(tag, "");
+            }
+            return out.trim().to_owned();
+        }
+        let trimmed = text.trim_start();
+        let rest = trimmed
+            .strip_prefix("<at>")
+            .and_then(|r| r.find("</at>").map(|i| &r[i + "</at>".len()..]))
+            .unwrap_or(trimmed);
+        rest.trim().to_owned()
+    }
+
+    /// Returns `true` for a card `Action.Submit`: a message with a `value`
+    /// and no text.
+    #[must_use]
+    pub fn is_card_submit(&self) -> bool {
+        self.kind == types::MESSAGE
+            && self.value.is_some()
+            && self.text.as_deref().is_none_or(|t| t.trim().is_empty())
+    }
+
+    /// The first word of [`Self::text_without_bot_mention`], in lower case
+    /// and with no leading `/`, and the rest of the text.
     #[must_use]
     pub fn command(&self) -> Option<(String, String)> {
-        let text = self.text_without_mentions();
+        let text = self.text_without_bot_mention();
         let (word, rest) = text.split_once(char::is_whitespace).unwrap_or((&text, ""));
         let word = word.trim_start_matches('/').to_lowercase();
         (!word.is_empty()).then(|| (word, rest.trim().to_owned()))
@@ -325,7 +387,7 @@ impl Activity {
     }
 
     /// Teams event type from `channelData.eventType`, for example
-    /// `channelCreated`.
+    /// `channelCreated`. Compare without case: Teams is not consistent.
     #[must_use]
     pub fn event_type(&self) -> Option<&str> {
         self.channel_data_str(&["eventType"])
@@ -374,6 +436,13 @@ impl Activity {
     }
 }
 
+/// Escapes `&`, `<`, and `>` for Teams message text.
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
 /// An Adaptive Card Universal Action (`Action.Execute`).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[non_exhaustive]
@@ -385,8 +454,9 @@ pub struct CardAction {
     pub data: Value,
 }
 
-/// The parts of a conversation that a bot needs to send to it later. Store
-/// it (it is serde) and use it with [`crate::TeamsClient::send_to`].
+/// The parts of a conversation that a bot needs to send to it later. It is
+/// `Serialize` and `Deserialize`: store it, then use it with
+/// [`crate::TeamsClient::send_to`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
@@ -622,7 +692,31 @@ impl InvokeResponse {
         Self::json(200, body)
     }
 
-    /// Message extension reply: a list of result attachments.
+    /// Universal Action error reply. Teams needs HTTP 200; the error is in
+    /// the body. `status` is 400 or 500.
+    #[must_use]
+    pub fn card_error(status: u16, message: impl Into<String>) -> Self {
+        Self::json(
+            200,
+            json!({
+                "statusCode": status,
+                "type": "application/vnd.microsoft.error",
+                "value": { "code": status.to_string(), "message": message.into() },
+            }),
+        )
+    }
+
+    /// Message extension reply: Teams shows this text.
+    #[must_use]
+    pub fn compose_message(text: impl Into<String>) -> Self {
+        Self::json(
+            200,
+            json!({ "composeExtension": { "type": "message", "text": text.into() } }),
+        )
+    }
+
+    /// Message extension reply: a list of result attachments. An Adaptive
+    /// Card result needs a preview: see [`Attachment::with_preview`].
     #[must_use]
     pub fn compose_results(attachments: &[Attachment]) -> Self {
         Self::json(
@@ -655,9 +749,10 @@ mod tests {
     fn mentions_and_commands() {
         let a = msg("<at>Bot</at>  Deploy   prod <at>Ada</at> now ");
         assert_eq!(a.text_without_mentions(), "Deploy   prod  now");
+        // Only the bot mention goes: other mentions are arguments.
         assert_eq!(
             a.command(),
-            Some(("deploy".to_owned(), "prod  now".to_owned()))
+            Some(("deploy".to_owned(), "prod <at>Ada</at> now".to_owned()))
         );
         assert_eq!(msg("/Help").command(), Some(("help".into(), String::new())));
         assert_eq!(msg("<at>Bot</at>").command(), None);
@@ -755,6 +850,69 @@ mod tests {
         assert!(back.get("attachments").is_none());
         assert!(back.get("id").is_none());
         assert!(serde_json::from_value::<Activity>(json!({"text": "no type"})).is_err());
+    }
+
+    #[test]
+    fn unknown_fields_survive_in_nested_types() {
+        let raw = json!({
+            "type": "message",
+            "from": {"id": "29:u", "userRole": "guest"},
+            "conversation": {"id": "19:c", "tenantId": "t", "isFuture": 1},
+            "attachments": [{
+                "contentType": ADAPTIVE_CARD_CONTENT_TYPE,
+                "content": {},
+                "preview": {"contentType": "application/vnd.microsoft.card.thumbnail", "content": {"title": "t"}},
+                "thumbnailUrl": "https://x.example/t.png",
+            }],
+        });
+        let a: Activity = serde_json::from_value(raw.clone()).unwrap();
+        assert!(a.attachments[0].preview.is_some());
+        assert_eq!(serde_json::to_value(&a).unwrap(), raw);
+    }
+
+    #[test]
+    fn mention_names_are_escaped() {
+        let odd = ChannelAccount::new("29:x", Some("A&B <C>".into()));
+        let a = Activity::message("hi").with_mention(&odd);
+        assert_eq!(a.text.as_deref(), Some("<at>A&amp;B &lt;C&gt;</at> hi"));
+        assert_eq!(a.entities[0]["text"], "<at>A&amp;B &lt;C&gt;</at>");
+        assert_eq!(a.entities[0]["mentioned"]["name"], "A&B <C>");
+    }
+
+    #[test]
+    fn bot_mention_only_is_removed_for_commands() {
+        // No mention entities: only a leading mention is removed.
+        assert_eq!(
+            msg("<at>Bot</at> give <at>Ada</at> a hug").command(),
+            Some(("give".into(), "<at>Ada</at> a hug".into()))
+        );
+        // With entities: the bot mention, wherever it is.
+        let mut a = msg("please <at>Bot</at> deploy");
+        a.entities =
+            vec![json!({"type": "mention", "text": "<at>Bot</at>", "mentioned": {"id": "28:bot"}})];
+        assert_eq!(a.text_without_bot_mention(), "please  deploy");
+        assert_eq!(a.command(), Some(("please".into(), "deploy".into())));
+    }
+
+    #[test]
+    fn card_submit_and_more_reply_shapes() {
+        let mut a = msg("");
+        a.text = None;
+        a.value = Some(json!({"x": 1}));
+        assert!(a.is_card_submit());
+        assert!(!msg("hi").is_card_submit());
+        let m = InvokeResponse::compose_message("pick one").body.unwrap();
+        assert_eq!(
+            m,
+            json!({"composeExtension": {"type": "message", "text": "pick one"}})
+        );
+        let e = InvokeResponse::card_error(500, "Try later.");
+        assert_eq!(e.status, 200);
+        let b = e.body.unwrap();
+        assert_eq!(b["statusCode"], 500);
+        assert_eq!(b["type"], "application/vnd.microsoft.error");
+        assert_eq!(b["value"]["code"], "500");
+        assert_eq!(b["value"]["message"], "Try later.");
     }
 
     #[test]

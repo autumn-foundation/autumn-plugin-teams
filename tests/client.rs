@@ -196,14 +196,14 @@ async fn paged_members_follow_the_continuation_token() {
     );
     // One page.
     let page = c
-        .get_paged_members(SERVICE_URL, CONV, Some(2), Some("x"))
+        .get_paged_members(SERVICE_URL, CONV, Some(60), Some("x"))
         .await
         .unwrap();
     assert!(page.continuation_token.is_none());
     assert!(
         calls(&t)[3]
             .1
-            .ends_with("pagedmembers?pageSize=2&continuationToken=x")
+            .ends_with("pagedmembers?pageSize=60&continuationToken=x")
     );
 }
 

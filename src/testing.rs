@@ -154,13 +154,20 @@ impl TestAuthority {
     }
 
     /// Signs `claims` with RS256 and this key.
+    #[must_use]
+    pub fn sign(&self, claims: &Value) -> String {
+        self.sign_with(Algorithm::RS256, claims)
+    }
+
+    /// Signs `claims` with `alg` and this key. Use it to test that the
+    /// plugin refuses other RSA algorithms.
     ///
     /// # Panics
-    /// Never with the built-in test keys.
+    /// When `alg` is not an RSA algorithm.
     #[must_use]
     #[allow(clippy::expect_used)] // The test keys are fixed and valid.
-    pub fn sign(&self, claims: &Value) -> String {
-        let mut header = Header::new(Algorithm::RS256);
+    pub fn sign_with(&self, alg: Algorithm, claims: &Value) -> String {
+        let mut header = Header::new(alg);
         header.kid = Some(self.kid.clone());
         let key = EncodingKey::from_rsa_pem(self.pem.as_bytes()).expect("test key is valid");
         jsonwebtoken::encode(&header, claims, &key).expect("test key signs")

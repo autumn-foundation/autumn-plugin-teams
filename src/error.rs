@@ -49,7 +49,7 @@ pub enum TeamsError {
     /// The `serviceUrl` is not an allowed Connector URL.
     #[error("serviceUrl is not an allowed Connector URL")]
     BadServiceUrl,
-    /// Request verification failed.
+    /// The JWT check failed.
     #[error(transparent)]
     Auth(#[from] AuthError),
 }

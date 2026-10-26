@@ -10,6 +10,9 @@
 //!    tenant and channel allowlists.
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use autumn_web::time::{ClockSource, clock_unix_secs};
 
 use futures::future::BoxFuture;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation};
@@ -19,7 +22,7 @@ use serde_json::Value;
 use crate::activity::Activity;
 use crate::error::TeamsError;
 use crate::metrics::TeamsMetrics;
-use crate::policy::{keys_fresh, may_refresh_keys, token_time_valid};
+use crate::policy::{MAX_STALE_KEY_AGE_SECS, keys_fresh, may_refresh_keys, token_time_valid};
 use crate::transport::{HttpRequest, HttpTransport, Method};
 
 /// Largest `Authorization` header that the check reads.
@@ -299,14 +302,25 @@ pub(crate) struct VerifierRules {
     pub key_min_refresh_secs: u64,
 }
 
+/// Time limit for one key set load.
+const KEY_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The key cache. Shared with refresh tasks.
+struct KeyCache {
+    source: Arc<dyn KeySource>,
+    metrics: Arc<TeamsMetrics>,
+    clock: Arc<dyn ClockSource>,
+    cache_secs: u64,
+    min_refresh_secs: u64,
+    cache: Mutex<Cache>,
+    /// Lets one key refresh run at a time.
+    refresh: Arc<tokio::sync::Mutex<()>>,
+}
+
 /// Checks the `Authorization` header. Caches the keys.
 pub(crate) struct Verifier {
     rules: VerifierRules,
-    source: Arc<dyn KeySource>,
-    metrics: Arc<TeamsMetrics>,
-    cache: Mutex<Cache>,
-    /// Lets one key refresh run at a time.
-    refresh: tokio::sync::Mutex<()>,
+    keys: Arc<KeyCache>,
 }
 
 impl Verifier {
@@ -314,22 +328,26 @@ impl Verifier {
         rules: VerifierRules,
         source: Arc<dyn KeySource>,
         metrics: Arc<TeamsMetrics>,
+        clock: Arc<dyn ClockSource>,
     ) -> Self {
-        Self {
-            rules,
+        let keys = Arc::new(KeyCache {
             source,
             metrics,
+            clock,
+            cache_secs: rules.key_cache_secs,
+            min_refresh_secs: rules.key_min_refresh_secs,
             cache: Mutex::new(Cache::default()),
-            refresh: tokio::sync::Mutex::const_new(()),
-        }
+            refresh: Arc::new(tokio::sync::Mutex::const_new(())),
+        });
+        Self { rules, keys }
     }
 
-    /// Checks the header value at `now` (Unix seconds).
+    /// Checks the header value.
     pub(crate) async fn verify(
         &self,
         authorization: Option<&str>,
-        now: u64,
     ) -> Result<VerifiedToken, AuthError> {
+        let now = self.keys.now();
         let header = authorization.ok_or(AuthError::MissingToken)?;
         if header.len() > MAX_TOKEN_BYTES {
             return Err(AuthError::Malformed);
@@ -345,7 +363,7 @@ impl Verifier {
             return Err(AuthError::Algorithm);
         }
         let kid = head.kid.ok_or(AuthError::UnknownKey)?;
-        let key = self.key(&kid, now).await?;
+        let key = self.keys.key(&kid, now).await?;
         let decoding =
             DecodingKey::from_rsa_components(&key.n, &key.e).map_err(|_| AuthError::Signature)?;
         // The plugin checks the claims itself, with the autumn clock.
@@ -381,35 +399,92 @@ impl Verifier {
             endorsements: key.endorsements,
         })
     }
+}
 
-    /// Looks up `kid` in the cache. Returns the key and `true` when the
-    /// cache is fresh.
-    fn lookup(&self, kid: &str, now: u64) -> (Option<SigningKey>, bool) {
-        let cache = lock(&self.cache);
-        cache.keys.as_ref().map_or((None, false), |(set, at)| {
-            (
-                set.get(kid).cloned(),
-                keys_fresh(now, *at, self.rules.key_cache_secs),
-            )
-        })
+impl KeyCache {
+    fn now(&self) -> u64 {
+        clock_unix_secs(self.clock.as_ref())
     }
 
-    /// Returns the key for `kid`. Loads the key set when the cache is stale,
-    /// or when `kid` is unknown. One load runs at a time.
-    async fn key(&self, kid: &str, now: u64) -> Result<SigningKey, AuthError> {
-        if let (Some(k), true) = self.lookup(kid, now) {
-            return Ok(k);
+    /// Finds `kid` in the cache. Also returns `true` when the cache is
+    /// fresh, and `true` when it is young enough to use after a failed
+    /// refresh.
+    fn find(&self, kid: &str, now: u64) -> (Option<SigningKey>, bool, bool) {
+        let cache = lock(&self.cache);
+        cache
+            .keys
+            .as_ref()
+            .map_or((None, false, false), |(set, at)| {
+                (
+                    set.get(kid).cloned(),
+                    keys_fresh(now, *at, self.cache_secs),
+                    keys_fresh(now, *at, MAX_STALE_KEY_AGE_SECS),
+                )
+            })
+    }
+
+    /// Returns the key for `kid`.
+    ///
+    /// - Fresh cache: no load.
+    /// - Stale cache, known `kid`: the old key serves, and one refresh runs
+    ///   in the background.
+    /// - No keys, keys older than 5 days, or an unknown `kid`: the request
+    ///   waits for a refresh.
+    ///
+    /// A refresh runs in its own task, so a dropped request does not stop it.
+    async fn key(self: &Arc<Self>, kid: &str, now: u64) -> Result<SigningKey, AuthError> {
+        let (found, fresh, usable) = self.find(kid, now);
+        if let Some(k) = found {
+            if fresh {
+                return Ok(k);
+            }
+            if usable {
+                if let Ok(turn) = Arc::clone(&self.refresh).try_lock_owned() {
+                    let me = Arc::clone(self);
+                    drop(tokio::spawn(async move { me.refresh(None, turn).await }));
+                }
+                return Ok(k);
+            }
         }
-        let _turn = self.refresh.lock().await;
-        // Another task can have loaded the keys while this one waited.
-        let (found, fresh) = self.lookup(kid, now);
-        if let (Some(k), true) = (&found, fresh) {
-            return Ok(k.clone());
+        let me = Arc::clone(self);
+        let want = kid.to_owned();
+        tokio::spawn(async move {
+            me.refresh(Some(&want), Arc::clone(&me.refresh).lock_owned().await)
+                .await;
+        })
+        .await
+        .map_err(|_| AuthError::KeysUnavailable)?;
+        let now = self.now();
+        let cache = lock(&self.cache);
+        match &cache.keys {
+            Some((set, at)) if keys_fresh(now, *at, MAX_STALE_KEY_AGE_SECS) => {
+                set.get(kid).cloned().ok_or(AuthError::UnknownKey)
+            }
+            _ => Err(AuthError::KeysUnavailable),
         }
-        let min = self.rules.key_min_refresh_secs;
+    }
+
+    /// Loads the key set if the rules allow it. `kid` is the unknown key
+    /// that a request waits for, if any. The caller holds the refresh lock.
+    async fn refresh(&self, kid: Option<&str>, _turn: tokio::sync::OwnedMutexGuard<()>) {
+        let now = self.now();
+        let min = self.min_refresh_secs;
         let load = {
             let mut cache = lock(&self.cache);
-            if fresh {
+            let fresh = cache
+                .keys
+                .as_ref()
+                .is_some_and(|(_, at)| keys_fresh(now, *at, self.cache_secs));
+            let known = kid.is_none_or(|k| {
+                cache
+                    .keys
+                    .as_ref()
+                    .is_some_and(|(set, _)| set.get(k).is_some())
+            });
+            if fresh && known {
+                // Another task loaded the keys during the wait.
+                false
+            } else if fresh {
                 // Unknown `kid`: Microsoft can add a key at any time.
                 let ok = may_refresh_keys(now, cache.last_unknown_kid, min);
                 if ok {
@@ -421,26 +496,28 @@ impl Verifier {
                 may_refresh_keys(now, cache.last_failure, min)
             }
         };
-        if load {
-            match self.source.fetch().await {
-                Ok(set) => {
-                    self.metrics.key_refresh("ok");
-                    let mut cache = lock(&self.cache);
-                    cache.keys = Some((set, now));
-                    cache.last_failure = None;
-                }
-                Err(e) => {
-                    // Keep the old keys. A short outage does not stop the bot.
-                    self.metrics.key_refresh("error");
-                    tracing::warn!(error = %e, "teams: signing key load failed");
-                    lock(&self.cache).last_failure = Some(now);
-                }
-            }
+        if !load {
+            return;
         }
-        let cache = lock(&self.cache);
-        match &cache.keys {
-            Some((set, _)) => set.get(kid).cloned().ok_or(AuthError::UnknownKey),
-            None => Err(AuthError::KeysUnavailable),
+        match tokio::time::timeout(KEY_FETCH_TIMEOUT, self.source.fetch()).await {
+            Ok(Ok(set)) => {
+                self.metrics.key_refresh("ok");
+                let mut cache = lock(&self.cache);
+                cache.keys = Some((set, now));
+                cache.last_failure = None;
+                // A new set also uses up the budget for unknown keys.
+                cache.last_unknown_kid = Some(now);
+            }
+            failed => {
+                // Keep the old keys. A short outage does not stop the bot.
+                self.metrics.key_refresh("error");
+                if let Ok(Err(e)) = failed {
+                    tracing::warn!(error = %e, "teams: signing key refresh failed");
+                } else {
+                    tracing::warn!("teams: signing key refresh timed out");
+                }
+                lock(&self.cache).last_failure = Some(now);
+            }
         }
     }
 }

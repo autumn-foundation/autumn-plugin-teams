@@ -5,7 +5,7 @@ use std::time::{Duration, SystemTime};
 
 use autumn_web::AppState;
 use autumn_web::reexports::axum::{
-    body::Bytes,
+    body::{Body, to_bytes},
     http::{HeaderMap, StatusCode, header::AUTHORIZATION},
     response::Response,
 };
@@ -53,13 +53,28 @@ impl Engine {
         ok()
     }
 
+    /// Accepts an activity for a run: 503 when shutdown started after the
+    /// route check, else counts it.
+    fn accept(&self) -> Option<Response> {
+        if self.runner.tracker.is_closed() {
+            self.metrics.request("shutting_down");
+            return Some(status(StatusCode::SERVICE_UNAVAILABLE));
+        }
+        self.metrics.request("ok");
+        None
+    }
+
     /// Handles `POST {base}/messages`.
-    pub(crate) async fn messages(&self, headers: &HeaderMap, body: Bytes) -> Response {
-        // The token check needs no body. It runs before any parse.
+    pub(crate) async fn messages(self: Arc<Self>, headers: &HeaderMap, body: Body) -> Response {
+        // The JWT check needs no body. It runs before the body is read.
         let auth = headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok());
-        let token = match self.verifier.verify(auth, self.now_secs()).await {
+        let token = match self.verifier.verify(auth).await {
             Ok(t) => t,
             Err(e) => return self.reject(&e),
+        };
+        let Ok(body) = to_bytes(body, self.config.max_body_bytes).await else {
+            self.metrics.request("too_large");
+            return status(StatusCode::PAYLOAD_TOO_LARGE);
         };
         let Ok(activity) = serde_json::from_slice::<Activity>(&body) else {
             self.metrics.request("bad_request");
@@ -74,108 +89,101 @@ impl Engine {
         ) {
             return self.reject(&e);
         }
-        // The check above makes sure that `serviceUrl` is set.
+        // The check above verifies that `serviceUrl` is set.
         let Some(reference) = activity.conversation_reference() else {
             self.metrics.request("bad_request");
             return status(StatusCode::BAD_REQUEST);
         };
         let ctx = TeamsContext::new(self.client.clone(), self.state.clone(), reference);
-        match activity.kind.as_str() {
-            types::MESSAGE => self.message(ctx, activity).await,
-            types::CONVERSATION_UPDATE => self.conversation_update(ctx, activity).await,
-            types::MESSAGE_REACTION => self.background(Kind::Reaction, "", ctx, activity).await,
-            types::INSTALLATION_UPDATE => {
-                self.background(Kind::InstallationUpdate, "", ctx, activity)
-                    .await
-            }
-            types::EVENT => {
-                let name = activity.name.clone().unwrap_or_default();
-                self.background(Kind::Event, &name, ctx, activity).await
-            }
-            types::INVOKE => self.invoke(ctx, activity).await,
-            _ => self.unhandled(),
-        }
-    }
-
-    /// Returns `true` for a new activity. Drops a repeat ID in the same
-    /// conversation. An activity with no ID is always new. A store error
-    /// gives `true`: delivery is at least once.
-    async fn fresh(&self, activity: &Activity) -> bool {
-        let (Some(id), Some(conv)) = (&activity.id, &activity.conversation) else {
-            return true;
+        let kind = match activity.kind.as_str() {
+            types::MESSAGE => return self.message(ctx, activity),
+            types::CONVERSATION_UPDATE => return self.conversation_update(ctx, activity),
+            types::INVOKE => return self.invoke(ctx, activity).await,
+            types::MESSAGE_UPDATE => Kind::MessageUpdate,
+            types::MESSAGE_DELETE => Kind::MessageDelete,
+            types::MESSAGE_REACTION => Kind::Reaction,
+            types::INSTALLATION_UPDATE => Kind::InstallationUpdate,
+            types::EVENT => Kind::Event,
+            _ => return self.unhandled(),
         };
-        let key = format!("teams:activity:{}:{id}", conv.id);
-        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(self.now_secs());
-        let window = Duration::from_secs(self.config.dedup_window_secs);
-        match self.replay.check_and_insert(&key, now, window).await {
-            Ok(fresh) => {
-                if !fresh {
-                    self.metrics.request("duplicate");
-                }
-                fresh
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "teams dedup store failed; running the handler");
-                true
-            }
-        }
+        let key = if kind == Kind::Event {
+            activity.name.clone().unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let Some(handler) = self.registry.background(kind, &key) else {
+            return self.unhandled();
+        };
+        let jobs = vec![(kind, Arc::clone(handler))];
+        self.run_once(ctx, activity, jobs, None)
     }
 
-    /// Runs one background handler of `kind` and `key`, if any.
-    async fn background(
+    /// Runs `jobs` for `activity` in a tracked task, after the dedup check.
+    /// The ack does not wait. A failed run of the first job replies with
+    /// `error_text` when `error_text` is set.
+    ///
+    /// The dedup check is in the task: a dropped request cannot leave a
+    /// stored ID with no run.
+    fn run_once(
         &self,
-        kind: Kind,
-        key: &str,
         ctx: TeamsContext,
         activity: Activity,
+        jobs: Vec<(Kind, Handler<()>)>,
+        error_text: Option<String>,
     ) -> Response {
-        let Some(handler) = self.registry.background(kind, key) else {
-            return self.unhandled();
-        };
-        if !self.fresh(&activity).await {
-            return ok();
+        if let Some(r) = self.accept() {
+            return r;
         }
-        self.metrics.request("ok");
-        drop(self.runner.spawn(kind, Arc::clone(handler), ctx, activity));
-        ok()
-    }
-
-    /// A message: a command handler by first word, else `on_message`. A
-    /// failed run replies with `error_text`.
-    async fn message(&self, ctx: TeamsContext, activity: Activity) -> Response {
-        let command = activity
-            .command()
-            .and_then(|(word, _)| self.registry.background(Kind::Command, &word))
-            .map(|h| (Kind::Command, h));
-        let Some((kind, handler)) = command.or_else(|| {
-            self.registry
-                .background(Kind::Message, "")
-                .map(|h| (Kind::Message, h))
-        }) else {
-            return self.unhandled();
+        let dedup = Dedup {
+            replay: Arc::clone(&self.replay),
+            metrics: Arc::clone(&self.metrics),
+            window: Duration::from_secs(self.config.dedup_window_secs),
+            now: self.now_secs(),
         };
-        if !self.fresh(&activity).await {
-            return ok();
-        }
-        self.metrics.request("ok");
-        let handle = self
-            .runner
-            .spawn(kind, Arc::clone(handler), ctx.clone(), activity);
-        let error_text = self.config.error_text.clone();
+        let runner = self.runner.clone();
         self.runner.spawn_task(async move {
+            if !dedup.fresh(&activity).await {
+                return;
+            }
+            let mut first = None;
+            for (kind, handler) in jobs {
+                let handle = runner.spawn(kind, handler, ctx.clone(), activity.clone());
+                first.get_or_insert(handle);
+            }
+            let (Some(text), Some(handle)) = (error_text, first) else {
+                return;
+            };
             if matches!(handle.await, Ok(RunOutcome::Ok(()))) {
                 return;
             }
             // No error detail goes to Teams.
-            if let Err(e) = ctx.reply(Activity::message(error_text)).await {
+            if let Err(e) = ctx.reply(Activity::message(text)).await {
                 tracing::warn!(error = %e, "teams error reply failed");
             }
         });
         ok()
     }
 
+    /// A message: a command handler by first word, else `on_message`. A
+    /// failed run replies with `error_text`.
+    fn message(&self, ctx: TeamsContext, activity: Activity) -> Response {
+        let command = activity
+            .command()
+            .and_then(|(word, _)| self.registry.background(Kind::Command, &word))
+            .map(|h| (Kind::Command, Arc::clone(h)));
+        let Some(job) = command.or_else(|| {
+            self.registry
+                .background(Kind::Message, "")
+                .map(|h| (Kind::Message, Arc::clone(h)))
+        }) else {
+            return self.unhandled();
+        };
+        let text = self.config.error_text.clone();
+        self.run_once(ctx, activity, vec![job], Some(text))
+    }
+
     /// Members added, members removed, and the general update handler.
-    async fn conversation_update(&self, ctx: TeamsContext, activity: Activity) -> Response {
+    fn conversation_update(&self, ctx: TeamsContext, activity: Activity) -> Response {
         let mut kinds = Vec::new();
         if !activity.members_added.is_empty() {
             kinds.push(Kind::MembersAdded);
@@ -184,31 +192,25 @@ impl Engine {
             kinds.push(Kind::MembersRemoved);
         }
         kinds.push(Kind::ConversationUpdate);
-        let handlers: Vec<(Kind, Handler<()>)> = kinds
+        let jobs: Vec<(Kind, Handler<()>)> = kinds
             .into_iter()
             .filter_map(|k| self.registry.background(k, "").map(|h| (k, Arc::clone(h))))
             .collect();
-        if handlers.is_empty() {
+        if jobs.is_empty() {
             return self.unhandled();
         }
-        if !self.fresh(&activity).await {
-            return ok();
-        }
-        self.metrics.request("ok");
-        for (kind, handler) in handlers {
-            drop(
-                self.runner
-                    .spawn(kind, handler, ctx.clone(), activity.clone()),
-            );
-        }
-        ok()
+        self.run_once(ctx, activity, jobs, None)
     }
 
     /// An invoke: a card action by verb, else an invoke by name. The reply
     /// is the HTTP reply. After `invoke_timeout_ms`, an empty 200.
+    ///
+    /// No dedup: Teams sends an invoke again only when it got no reply, and
+    /// it needs a reply each time.
     async fn invoke(&self, ctx: TeamsContext, activity: Activity) -> Response {
         let name = activity.name.clone().unwrap_or_default();
-        let card = (name == ADAPTIVE_CARD_ACTION)
+        let is_card = name == ADAPTIVE_CARD_ACTION;
+        let card = is_card
             .then(|| activity.card_action())
             .flatten()
             .and_then(|a| self.registry.invoke(Kind::CardAction, &a.verb))
@@ -219,26 +221,87 @@ impl Engine {
                 .map(|h| (Kind::Invoke, h))
         }) else {
             self.metrics.request("unhandled");
+            // Universal Actions need HTTP 200, with the error in the body.
+            if is_card {
+                return invoke_reply(&self.card_error(400));
+            }
             return status(StatusCode::NOT_IMPLEMENTED);
         };
-        if !self.fresh(&activity).await {
-            return ok();
+        if let Some(r) = self.accept() {
+            return r;
         }
-        self.metrics.request("ok");
         let mut handle = self.runner.spawn(kind, Arc::clone(handler), ctx, activity);
         let limit = Duration::from_millis(self.config.invoke_timeout_ms);
+        let failed = |is_card: bool| {
+            // No error detail goes to Teams.
+            if is_card {
+                invoke_reply(&self.card_error(500))
+            } else {
+                status(StatusCode::INTERNAL_SERVER_ERROR)
+            }
+        };
         match tokio::time::timeout(limit, &mut handle).await {
             Ok(Ok(RunOutcome::Ok(reply))) => invoke_reply(&reply),
-            // An error or a panic: no detail goes to Teams.
-            Ok(_) => status(StatusCode::INTERNAL_SERVER_ERROR),
+            Ok(_) => failed(is_card),
             Err(_) => {
-                // Teams waits 5 s only. The handler goes on; its reply is lost.
+                // Teams waits 5 s only. The handler continues. Teams does
+                // not get its reply.
                 self.metrics.late_ack();
-                tracing::warn!("teams invoke reply is late; sent an empty 200");
-                ok()
+                tracing::warn!("teams invoke reply is late; sent a fallback reply");
+                if is_card { failed(true) } else { ok() }
             }
         }
     }
+
+    fn card_error(&self, status: u16) -> InvokeResponse {
+        InvokeResponse::card_error(status, self.config.error_text.clone())
+    }
+}
+
+/// Time limit for one dedup check. After it, the handler runs: delivery is
+/// at least once.
+const DEDUP_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// What the dedup check needs, for a task.
+struct Dedup {
+    replay: Arc<dyn WebhookReplayStore>,
+    metrics: Arc<TeamsMetrics>,
+    window: Duration,
+    now: u64,
+}
+
+impl Dedup {
+    /// Returns `true` for a new activity. Drops a repeat ID in the same
+    /// conversation. An activity with no ID is always new. A store error or
+    /// a slow store gives `true`.
+    async fn fresh(&self, activity: &Activity) -> bool {
+        let (Some(id), Some(conv)) = (&activity.id, &activity.conversation) else {
+            return true;
+        };
+        let key = dedup_key(&conv.id, id);
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(self.now);
+        let check = self.replay.check_and_insert(&key, now, self.window);
+        match tokio::time::timeout(DEDUP_TIMEOUT, check).await {
+            Ok(Ok(true)) => true,
+            Ok(Ok(false)) => {
+                self.metrics.request("duplicate");
+                false
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "teams dedup store failed; running the handler");
+                true
+            }
+            Err(_) => {
+                tracing::warn!("teams dedup store is slow; running the handler");
+                true
+            }
+        }
+    }
+}
+
+/// The dedup key. The length prefix keeps `a:b` + `c` apart from `a` + `b:c`.
+fn dedup_key(conversation: &str, id: &str) -> String {
+    format!("teams:activity:{}:{conversation}:{id}", conversation.len())
 }
 
 /// The HTTP reply for an invoke result.
@@ -248,4 +311,15 @@ fn invoke_reply(reply: &InvokeResponse) -> Response {
         .body
         .as_ref()
         .map_or_else(|| status(code), |b| json(code, b))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dedup_keys_do_not_collide() {
+        assert_ne!(dedup_key("a:b", "c"), dedup_key("a", "b:c"));
+        assert_eq!(dedup_key("19:x", "1"), "teams:activity:4:19:x:1");
+    }
 }
