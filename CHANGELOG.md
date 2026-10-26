@@ -22,8 +22,9 @@ All notable changes to this project are documented here. The format follows
 - Handlers for `messageUpdate` and `messageDelete`.
 - Universal Action replies keep HTTP 200. An error goes in the body
   (`InvokeResponse::card_error`).
-- `Attachment::with_preview`, `InvokeResponse::compose_message`, and
-  `Activity::is_card_submit` for message extensions and card submits.
+- `Attachment::with_preview`, `InvokeResponse::compose_message`,
+  `InvokeResponse::with_task_size`, `ConversationParameters::channel`, and
+  `Activity::is_card_submit`.
 - Client-credentials app token for single-tenant and multi-tenant bots, with
   a cache and one request at a time. Callers that wait share the result.
 - Verus proves the retry rules: 429 and 412 wait for `Retry-After`, 5xx and

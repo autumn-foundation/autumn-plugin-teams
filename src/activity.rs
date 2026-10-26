@@ -511,6 +511,22 @@ pub struct ConversationParameters {
 }
 
 impl ConversationParameters {
+    /// A new thread in the channel `channel_id`, with `activity` as the
+    /// first post.
+    #[must_use]
+    pub fn channel(channel_id: &str, tenant_id: &str, activity: Activity) -> Self {
+        Self {
+            is_group: true,
+            tenant_id: Some(tenant_id.to_owned()),
+            activity: Some(activity),
+            channel_data: Some(json!({
+                "channel": { "id": channel_id },
+                "tenant": { "id": tenant_id },
+            })),
+            ..Self::default()
+        }
+    }
+
     /// A 1:1 conversation between `bot` and `user` in `tenant_id`.
     #[must_use]
     pub fn personal(bot: ChannelAccount, user: ChannelAccount, tenant_id: &str) -> Self {
@@ -715,6 +731,22 @@ impl InvokeResponse {
         )
     }
 
+    /// Sets the dialog size of a [`Self::task_card`] reply: `small`,
+    /// `medium`, `large`, or a number of pixels. Other replies do not change.
+    #[must_use]
+    pub fn with_task_size(mut self, height: &str, width: &str) -> Self {
+        if let Some(value) = self
+            .body
+            .as_mut()
+            .and_then(|b| b.pointer_mut("/task/value"))
+            .and_then(Value::as_object_mut)
+        {
+            value.insert("height".to_owned(), json!(height));
+            value.insert("width".to_owned(), json!(width));
+        }
+        self
+    }
+
     /// Message extension reply: a list of result attachments. An Adaptive
     /// Card result needs a preview: see [`Attachment::with_preview`].
     #[must_use]
@@ -913,6 +945,28 @@ mod tests {
         assert_eq!(b["type"], "application/vnd.microsoft.error");
         assert_eq!(b["value"]["code"], "500");
         assert_eq!(b["value"]["message"], "Try later.");
+    }
+
+    #[test]
+    fn channel_thread_parameters_and_sized_task() {
+        let p =
+            ConversationParameters::channel("19:ch@thread.tacv2", "t1", Activity::message("hi"));
+        let v = serde_json::to_value(&p).unwrap();
+        assert_eq!(v["isGroup"], true);
+        assert_eq!(v["channelData"]["channel"]["id"], "19:ch@thread.tacv2");
+        assert_eq!(v["channelData"]["tenant"]["id"], "t1");
+        assert_eq!(v["activity"]["text"], "hi");
+        let t = InvokeResponse::task_card("Form", json!({}))
+            .with_task_size("large", "medium")
+            .body
+            .unwrap();
+        assert_eq!(t["task"]["value"]["height"], "large");
+        assert_eq!(t["task"]["value"]["width"], "medium");
+        // Size on a reply that is not a task card does nothing.
+        assert_eq!(
+            InvokeResponse::ok().with_task_size("small", "small").body,
+            None
+        );
     }
 
     #[test]
