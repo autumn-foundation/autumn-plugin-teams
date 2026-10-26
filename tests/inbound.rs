@@ -512,7 +512,11 @@ async fn repeat_activity_id_runs_the_handler_once() {
     post(&client, &m).await.assert_status(200);
     assert_eq!(recv(&mut rx).await, "once");
     assert_no_handler(&mut rx).await;
-    assert_eq!(metrics.requests("duplicate"), 1);
+    // The dedup check runs in the background task.
+    wait_until(Duration::from_secs(5), &|| {
+        metrics.requests("duplicate") == 1
+    })
+    .await;
     // The same ID in another conversation is not a repeat.
     m.conversation.as_mut().unwrap().id = "19:other@thread.tacv2".into();
     post(&client, &m).await.assert_status(200);

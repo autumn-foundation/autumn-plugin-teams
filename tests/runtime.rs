@@ -468,8 +468,10 @@ async fn metrics_count_requests_handlers_and_calls() {
     let client = TestApp::new().plugin(p).build();
     post(&client, &message("hi")).await.assert_status(200);
     post_raw(&client, None, "{}").await.assert_status(401);
+    // The run counts after the handler returns, a moment after its call.
     wait_until(Duration::from_secs(5), &|| {
         metrics.api_calls("reply_to_activity", "ok") == 1
+            && metrics.handler_runs("command", "ok") == 1
     })
     .await;
     assert_eq!(metrics.requests("ok"), 1);
