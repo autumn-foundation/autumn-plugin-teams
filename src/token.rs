@@ -8,8 +8,8 @@ use serde::Deserialize;
 use crate::error::TeamsError;
 use crate::metrics::TeamsMetrics;
 use crate::policy::{
-    Outcome, RetryRule, Step, decide, retry_after_ms, token_expires_at, token_margin,
-    token_needs_refresh,
+    Outcome, RetryRule, Step, decide, may_refresh_keys, retry_after_ms, token_expires_at,
+    token_margin, token_needs_refresh,
 };
 use crate::transport::{HttpReply, HttpRequest, HttpTransport, Method, TransportError};
 
@@ -51,6 +51,8 @@ struct State {
     generation: u64,
     /// The error code of the last request, if it failed.
     last_error: Option<String>,
+    /// The time of the last failed request.
+    last_failure_at: Option<u64>,
 }
 
 /// The token endpoint reply.
@@ -62,6 +64,8 @@ struct TokenReply {
 
 /// Smallest token life that the cache uses.
 const MIN_TOKEN_SECS: u64 = 60;
+/// After a failed request, the next background refresh waits this long.
+const RETRY_AFTER_FAILURE_SECS: u64 = 30;
 
 /// Gets and caches the app token. One request runs at a time.
 pub(crate) struct TokenProvider {
@@ -71,7 +75,7 @@ pub(crate) struct TokenProvider {
     metrics: Arc<TeamsMetrics>,
     rule: RetryRule,
     state: Mutex<State>,
-    refresh: tokio::sync::Mutex<()>,
+    refresh: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl std::fmt::Debug for TokenProvider {
@@ -97,7 +101,7 @@ impl TokenProvider {
             metrics,
             rule,
             state: Mutex::new(State::default()),
-            refresh: tokio::sync::Mutex::const_new(()),
+            refresh: Arc::new(tokio::sync::Mutex::const_new(())),
         }
     }
 
@@ -133,8 +137,10 @@ impl TokenProvider {
 
     /// Returns a valid token: from the cache, or a new one.
     ///
-    /// - While a refresh runs, a token that is not expired serves.
-    /// - Callers that wait for a refresh share its result, also an error.
+    /// - A token in its margin, but not expired, serves at once. A refresh
+    ///   starts in the background, at most once per 30 s after a failure.
+    /// - With no valid token, the caller waits for a refresh. Callers that
+    ///   wait share its result, also an error.
     /// - The refresh runs in its own task: a caller that stops waiting (for
     ///   example the health timeout) does not stop it.
     pub(crate) async fn token(self: &Arc<Self>) -> Result<String, TeamsError> {
@@ -142,9 +148,17 @@ impl TokenProvider {
         if let Some(t) = fresh {
             return Ok(t);
         }
-        if let Some(t) = usable
-            && self.refresh.try_lock().is_err()
-        {
+        if let Some(t) = usable {
+            let last_failure = self.lock().last_failure_at;
+            if may_refresh_keys(self.now(), last_failure, RETRY_AFTER_FAILURE_SECS)
+                && let Ok(turn) = Arc::clone(&self.refresh).try_lock_owned()
+            {
+                let me = Arc::clone(self);
+                drop(tokio::spawn(async move {
+                    // The caller has a token. A failure is logged only.
+                    let _ = me.refresh_locked(generation, turn).await;
+                }));
+            }
             return Ok(t);
         }
         if !self.has_password() {
@@ -154,19 +168,25 @@ impl TokenProvider {
             )));
         }
         let me = Arc::clone(self);
-        tokio::spawn(async move { me.refresh_after(generation).await })
-            .await
-            .unwrap_or_else(|_| {
-                Err(TeamsError::Token {
-                    code: "cancelled".to_owned(),
-                })
+        tokio::spawn(async move {
+            let turn = Arc::clone(&me.refresh).lock_owned().await;
+            me.refresh_locked(generation, turn).await
+        })
+        .await
+        .unwrap_or_else(|_| {
+            Err(TeamsError::Token {
+                code: "cancelled".to_owned(),
             })
+        })
     }
 
     /// Gets a new token, unless a request ended after `generation`. Then it
-    /// gives the result of that request.
-    async fn refresh_after(&self, generation: u64) -> Result<String, TeamsError> {
-        let _turn = self.refresh.lock().await;
+    /// gives the result of that request. The caller holds the refresh lock.
+    async fn refresh_locked(
+        &self,
+        generation: u64,
+        _turn: tokio::sync::OwnedMutexGuard<()>,
+    ) -> Result<String, TeamsError> {
         let (fresh, usable, now_generation) = self.peek();
         if let Some(t) = fresh {
             return Ok(t);
@@ -192,9 +212,11 @@ impl TokenProvider {
                     margin: token_margin(expires_in),
                 });
                 st.last_error = None;
+                st.last_failure_at = None;
                 Ok(token)
             }
             Err(e) => {
+                st.last_failure_at = Some(now);
                 if let TeamsError::Token { code } = &e {
                     st.last_error = Some(code.clone());
                 }

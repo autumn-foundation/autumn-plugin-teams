@@ -672,6 +672,62 @@ fn shutdown_hook(cell: &EngineCell) -> impl Future<Output = ()> + Send + use<> {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn activities_get_503_when_shutdown_starts_after_the_route_check() {
+        use autumn_web::reexports::axum::{body::Body, http::HeaderMap};
+        let authority = crate::testing::TestAuthority::new(crate::testing::APP_ID);
+        let rt = TeamsPlugin::with_config(TeamsConfig::default())
+            .with_app_id(crate::testing::APP_ID)
+            .with_app_password("pw")
+            .with_transport(crate::transport::MemoryTransport::new())
+            .with_key_source(authority.key_source())
+            .on_message(|_c, _a| async { Ok(()) })
+            .start(&AppState::for_test())
+            .unwrap();
+        let now = u64::try_from(autumn_web::reexports::chrono::Utc::now().timestamp()).unwrap();
+        let activity = crate::testing::message("x");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            authority.bearer(&activity, now).parse().unwrap(),
+        );
+        // The route saw an open tracker. Then shutdown starts.
+        rt.engine.runner.tracker.close();
+        let body = Body::from(serde_json::to_string(&activity).unwrap());
+        let res = Arc::clone(&rt.engine).messages(&headers, body).await;
+        assert_eq!(res.status().as_u16(), 503);
+        assert_eq!(rt.metrics().requests("shutting_down"), 1);
+    }
+
+    #[tokio::test]
+    async fn a_broken_body_gets_400_not_413() {
+        use autumn_web::reexports::axum::{body::Body, http::HeaderMap};
+        let authority = crate::testing::TestAuthority::new(crate::testing::APP_ID);
+        let rt = TeamsPlugin::with_config(TeamsConfig::default())
+            .with_app_id(crate::testing::APP_ID)
+            .with_app_password("pw")
+            .with_transport(crate::transport::MemoryTransport::new())
+            .with_key_source(authority.key_source())
+            .start(&AppState::for_test())
+            .unwrap();
+        let now = u64::try_from(autumn_web::reexports::chrono::Utc::now().timestamp()).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            authority
+                .bearer(&crate::testing::message("x"), now)
+                .parse()
+                .unwrap(),
+        );
+        let broken = futures::stream::iter([Err::<Vec<u8>, std::io::Error>(
+            std::io::Error::other("client went away"),
+        )]);
+        let res = Arc::clone(&rt.engine)
+            .messages(&headers, Body::from_stream(broken))
+            .await;
+        assert_eq!(res.status().as_u16(), 400);
+    }
+
     #[test]
     fn base_path_normalizes() {
         assert_eq!(normalize_base("/teams/"), "/teams");

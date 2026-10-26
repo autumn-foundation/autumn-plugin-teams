@@ -446,6 +446,11 @@ impl KeyCache {
                 return Ok(k);
             }
         }
+        // An unknown kid in a fresh set, with the refresh budget used up:
+        // fail at once. A flood of bad kids then holds no task and no lock.
+        if fresh && !self.may_refresh_unknown(now) {
+            return Err(AuthError::UnknownKey);
+        }
         let me = Arc::clone(self);
         let want = kid.to_owned();
         tokio::spawn(async move {
@@ -462,6 +467,15 @@ impl KeyCache {
             }
             _ => Err(AuthError::KeysUnavailable),
         }
+    }
+
+    /// Returns `true` when an unknown `kid` can refresh the key set now.
+    fn may_refresh_unknown(&self, now: u64) -> bool {
+        may_refresh_keys(
+            now,
+            lock(&self.cache).last_unknown_kid,
+            self.min_refresh_secs,
+        )
     }
 
     /// Loads the key set if the rules allow it. `kid` is the unknown key

@@ -53,14 +53,12 @@ impl Engine {
         ok()
     }
 
-    /// Accepts an activity for a run: 503 when shutdown started after the
-    /// route check, else counts it.
-    fn accept(&self) -> Option<Response> {
+    /// Gives 503 when shutdown started after the route check.
+    fn closing(&self) -> Option<Response> {
         if self.runner.tracker.is_closed() {
             self.metrics.request("shutting_down");
             return Some(status(StatusCode::SERVICE_UNAVAILABLE));
         }
-        self.metrics.request("ok");
         None
     }
 
@@ -72,9 +70,17 @@ impl Engine {
             Ok(t) => t,
             Err(e) => return self.reject(&e),
         };
-        let Ok(body) = to_bytes(body, self.config.max_body_bytes).await else {
-            self.metrics.request("too_large");
-            return status(StatusCode::PAYLOAD_TOO_LARGE);
+        let body = match to_bytes(body, self.config.max_body_bytes).await {
+            Ok(b) => b,
+            Err(e) => {
+                let (outcome, code) = if too_large(e) {
+                    ("too_large", StatusCode::PAYLOAD_TOO_LARGE)
+                } else {
+                    ("bad_request", StatusCode::BAD_REQUEST)
+                };
+                self.metrics.request(outcome);
+                return status(code);
+            }
         };
         let Ok(activity) = serde_json::from_slice::<Activity>(&body) else {
             self.metrics.request("bad_request");
@@ -131,7 +137,7 @@ impl Engine {
         jobs: Vec<(Kind, Handler<()>)>,
         error_text: Option<String>,
     ) -> Response {
-        if let Some(r) = self.accept() {
+        if let Some(r) = self.closing() {
             return r;
         }
         let dedup = Dedup {
@@ -145,6 +151,7 @@ impl Engine {
             if !dedup.fresh(&activity).await {
                 return;
             }
+            dedup.metrics.request("ok");
             let mut first = None;
             for (kind, handler) in jobs {
                 let handle = runner.spawn(kind, handler, ctx.clone(), activity.clone());
@@ -227,9 +234,10 @@ impl Engine {
             }
             return status(StatusCode::NOT_IMPLEMENTED);
         };
-        if let Some(r) = self.accept() {
+        if let Some(r) = self.closing() {
             return r;
         }
+        self.metrics.request("ok");
         let mut handle = self.runner.spawn(kind, Arc::clone(handler), ctx, activity);
         let limit = Duration::from_millis(self.config.invoke_timeout_ms);
         let failed = |is_card: bool| {
@@ -241,7 +249,13 @@ impl Engine {
             }
         };
         match tokio::time::timeout(limit, &mut handle).await {
-            Ok(Ok(RunOutcome::Ok(reply))) => invoke_reply(&reply),
+            // A Universal Action ack is HTTP 200 whatever the handler says.
+            Ok(Ok(RunOutcome::Ok(mut reply))) => {
+                if is_card {
+                    reply.status = 200;
+                }
+                invoke_reply(&reply)
+            }
             Ok(_) => failed(is_card),
             Err(_) => {
                 // Teams waits 5 s only. The handler continues. Teams does
@@ -304,7 +318,21 @@ fn dedup_key(conversation: &str, id: &str) -> String {
     format!("teams:activity:{}:{conversation}:{id}", conversation.len())
 }
 
-/// The HTTP reply for an invoke result.
+/// Returns `true` when the body read stopped at `max_body_bytes`. Other
+/// errors (for example a client that went away) are not "too large".
+fn too_large(e: autumn_web::reexports::axum::Error) -> bool {
+    let inner = e.into_inner();
+    let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(inner.as_ref());
+    while let Some(err) = cur {
+        if err.is::<http_body_util::LengthLimitError>() {
+            return true;
+        }
+        cur = err.source();
+    }
+    false
+}
+
+/// The HTTP ack for an invoke result.
 fn invoke_reply(reply: &InvokeResponse) -> Response {
     let code = StatusCode::from_u16(reply.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     reply

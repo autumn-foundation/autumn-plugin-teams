@@ -512,10 +512,14 @@ async fn token_is_cached_until_the_refresh_margin() {
     clock.advance(Duration::from_secs(3_299));
     send().await.unwrap();
     assert_eq!(t.requests_to(TOKEN_URL).len(), 1);
-    // 3600 - 300 s margin: refresh.
+    // 3600 - 300 s margin: the old token serves, and a refresh starts in
+    // the background.
     clock.advance(Duration::from_secs(1));
     send().await.unwrap();
-    assert_eq!(t.requests_to(TOKEN_URL).len(), 2);
+    wait_until(Duration::from_secs(5), &|| {
+        t.requests_to(TOKEN_URL).len() == 2
+    })
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread")]

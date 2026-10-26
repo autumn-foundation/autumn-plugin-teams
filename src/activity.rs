@@ -323,23 +323,29 @@ impl Activity {
     }
 
     /// The text without the mention of the bot (the recipient), trimmed.
-    /// Other mentions stay. With no mention entity, only a leading
+    /// Other mentions stay. With no mention entity at all, only a leading
     /// `<at>...</at>` is removed.
     #[must_use]
     pub fn text_without_bot_mention(&self) -> String {
         let text = self.text.as_deref().unwrap_or_default();
         let bot = self.recipient.as_ref().map(|r| r.id.as_str());
-        let tags: Vec<&str> = self
+        let mentions: Vec<&Value> = self
             .entities
             .iter()
             .filter(|e| e.get("type").and_then(Value::as_str) == Some("mention"))
-            .filter(|e| e.pointer("/mentioned/id").and_then(Value::as_str) == bot)
-            .filter_map(|e| e.get("text").and_then(Value::as_str))
             .collect();
-        if bot.is_some() && !tags.is_empty() {
+        if !mentions.is_empty() {
             let mut out = text.to_owned();
-            for tag in tags {
-                out = out.replace(tag, "");
+            let bot_tags = mentions
+                .iter()
+                .filter(|e| {
+                    bot.is_some() && e.pointer("/mentioned/id").and_then(Value::as_str) == bot
+                })
+                .filter_map(|e| e.get("text").and_then(Value::as_str))
+                .filter(|t| !t.is_empty());
+            // One entity is one mention: remove one copy per entity.
+            for tag in bot_tags {
+                out = out.replacen(tag, "", 1);
             }
             return out.trim().to_owned();
         }
@@ -433,6 +439,18 @@ impl Activity {
             service_url: self.service_url.clone()?,
             locale: self.locale.clone(),
         })
+    }
+}
+
+/// The error name for a Universal Action error status.
+fn error_code(status: u16) -> String {
+    match status {
+        400 => "BadRequest".to_owned(),
+        401 => "Unauthorized".to_owned(),
+        403 => "Forbidden".to_owned(),
+        404 => "NotFound".to_owned(),
+        500 => "InternalServerError".to_owned(),
+        s => s.to_string(),
     }
 }
 
@@ -717,7 +735,7 @@ impl InvokeResponse {
             json!({
                 "statusCode": status,
                 "type": "application/vnd.microsoft.error",
-                "value": { "code": status.to_string(), "message": message.into() },
+                "value": { "code": error_code(status), "message": message.into() },
             }),
         )
     }
@@ -927,6 +945,22 @@ mod tests {
     }
 
     #[test]
+    fn bot_mention_edge_cases() {
+        let mention = |text: &str, id: &str| json!({"type": "mention", "text": text, "mentioned": {"id": id}});
+        // Entities, but none for the bot: no text goes.
+        let mut a = msg("<at>Ada</at> deploy prod");
+        a.entities = vec![mention("<at>Ada</at>", "29:ada")];
+        assert_eq!(a.text_without_bot_mention(), "<at>Ada</at> deploy prod");
+        // One bot entity removes one copy only.
+        let mut a = msg("<at>Bot</at> greet <at>Bot</at>");
+        a.entities = vec![
+            mention("<at>Bot</at>", "28:bot"),
+            mention("<at>Bot</at>", "29:other-bot-name"),
+        ];
+        assert_eq!(a.text_without_bot_mention(), "greet <at>Bot</at>");
+    }
+
+    #[test]
     fn card_submit_and_more_reply_shapes() {
         let mut a = msg("");
         a.text = None;
@@ -943,8 +977,10 @@ mod tests {
         let b = e.body.unwrap();
         assert_eq!(b["statusCode"], 500);
         assert_eq!(b["type"], "application/vnd.microsoft.error");
-        assert_eq!(b["value"]["code"], "500");
+        assert_eq!(b["value"]["code"], "InternalServerError");
         assert_eq!(b["value"]["message"], "Try later.");
+        let b = InvokeResponse::card_error(400, "x").body.unwrap();
+        assert_eq!(b["value"]["code"], "BadRequest");
     }
 
     #[test]

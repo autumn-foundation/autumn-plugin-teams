@@ -129,7 +129,7 @@ async fn real_http_round_trip_with_token_keys_and_429_retry() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_huge_reply_body_is_refused() {
+async fn a_huge_reply_body_is_cut_at_the_cap() {
     let big = "x".repeat(autumn_plugin_teams::transport::MAX_REPLY_BYTES + 1);
     let ok = "y".repeat(1_000);
     let base = serve(
@@ -139,11 +139,17 @@ async fn a_huge_reply_body_is_refused() {
     )
     .await;
     let t = ReqwestTransport::new(Duration::from_secs(5)).unwrap();
-    let e = t
+    // Cut, not an error: a send that worked must not look like a network
+    // error, or the app can send it again.
+    let r = t
         .send(HttpRequest::new(Method::Get, format!("{base}big")))
         .await
-        .unwrap_err();
-    assert!(e.0.contains("too large"), "{e:?}");
+        .unwrap();
+    assert_eq!(r.status, 200);
+    assert_eq!(
+        r.body.len(),
+        autumn_plugin_teams::transport::MAX_REPLY_BYTES
+    );
     let r = t
         .send(HttpRequest::new(Method::Get, format!("{base}ok")))
         .await

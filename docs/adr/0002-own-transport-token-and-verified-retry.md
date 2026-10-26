@@ -39,11 +39,13 @@ Option 2.
 ## Results
 
 - Good: no double posts from retries.
-- Good: the token cache rules are verified: `token_margin` gives 5 min, or
-  half the life of a short token, and `token_needs_refresh` uses it.
+- Good: Verus proves `token_margin` (5 min, or half the life of a short
+  token) and `token_needs_refresh`. `src/token.rs` passes the margin;
+  `hardening::a_short_token_keeps_half_its_life` tests it.
 - Good: one token request runs at a time, in its own task. Callers that wait
-  share its result. The old token serves while a refresh runs. A cancelled
-  caller (for example a health timeout) does not stop the request.
+  share its result. In the margin, the old token serves at once and the
+  refresh runs in the background, at most once per 30 s after a failure. A
+  cancelled caller (for example a health timeout) does not stop the request.
 - Bad: Microsoft asks to retry 502 and 504. The plugin does not retry them
   for a POST, because a send can post two times.
 - Bad: autumn `[http_client]` config and interceptors do not apply to
@@ -52,14 +54,14 @@ Option 2.
 ## Ack strategy
 
 - Teams waits 5 s for an invoke reply. The plugin waits `invoke_timeout_ms`
-  (max 4.5 s) and then sends a fallback reply. A Universal Action reply is
-  always HTTP 200, with any error in the body.
+  (max 4.5 s) and then sends a fallback ack. A Universal Action ack is always
+  HTTP 200, with any error in the invoke reply body.
 - Other activities have no reply content. The plugin acks at once and runs
   the handler in the background.
 - The plugin drops a repeat activity ID per conversation, so a Connector
   retry does not run a handler two times. The dedup check runs in the
   background task: a dropped request cannot leave a stored ID with no run.
   Invokes have no dedup, because each one needs a reply.
-- At shutdown, the route replies 503 and the plugin waits for handlers up to
+- At shutdown, the route acks with 503 and the plugin waits for handlers up to
   `drain_timeout_secs`. A restart stops background handlers: use `#[job]` for
   durable work.

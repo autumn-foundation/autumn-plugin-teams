@@ -40,19 +40,21 @@ Option 3.
   refresh per `min_refresh_secs` for an unknown `kid`. So unknown `kid`
   values cannot flood the key endpoint.
 - A known `kid` serves from the old set while one background task refreshes.
-  A refresh never blocks a request that has a known key.
-- After a failed refresh, the old keys serve for 5 days at most
-  (`MAX_STALE_KEY_AGE_SECS`). Then the route replies 503.
-- RS256 is fixed in code. The token header cannot pick `none` or HS256.
+  While the set is less than 5 days old, a refresh never blocks a request
+  that has a known key.
+- After a failed refresh, the old keys serve until they are 5 days old,
+  counted from the last good refresh (`MAX_STALE_KEY_AGE_SECS`). Then the
+  route acks with 503.
+- RS256 is fixed in code. The JWT header cannot pick `none` or HS256.
 
 ## Results
 
-- Good: the JWT check runs before the body is read. The activity check runs
+- Good: the JWT check runs before the plugin reads the body. The activity check runs
   before any handler.
 - Bad: an attacker can use up the unknown-`kid` refresh just before Microsoft
   starts to use a new key. Real activities can then get 401 for up to
   `min_refresh_secs` (default 60 s).
-- Good: `TestAuthority` signs tokens with a test key, so app tests need no
+- Good: `TestAuthority` signs JWTs with a test key, so app tests need no
   Microsoft account.
 - Bad: two JWT checks exist in an app that also uses autumn OIDC.
 - Bad: the Bot Framework Emulator path (Entra issuers) is not in scope.

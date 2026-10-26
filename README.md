@@ -7,7 +7,7 @@ Microsoft Teams plugin for [autumn-web](https://autumn-web.app) 0.8.
 - Typed handlers by command, activity type, event name, invoke name, or
   Adaptive Card verb.
 - A Connector REST client. It gets an app token and retries safely. It sends
-  the token only to allowed hosts. It also sends proactive messages.
+  the app token only to allowed hosts. It also sends proactive messages.
 - A health indicator, Prometheus metrics, and a drain at shutdown.
 - Test helpers: a test JWT authority and a fake transport.
 
@@ -97,8 +97,8 @@ flowchart LR
   H -->|none| U[200, or 501 for an invoke]
   H -->|invoke| W{done in invoke_timeout_ms?}
   W -->|yes| IR[status + body]
-  W -->|no| L[fallback reply]
-  H -->|other| BG[dedup, then run in background] --> A1[200 at once]
+  W -->|no| L[fallback ack]
+  H -->|other| A1[200 at once] --> BG[task: dedup, then handler]
 ```
 
 | Step | Rule | Failure |
@@ -119,9 +119,9 @@ Key set rules:
   During the refresh, a known `kid` still works. The request does not wait.
 - An unknown `kid` refreshes the key set at most once per
   `keys.min_refresh_secs` (default 60 s).
-- After a failed refresh, the old keys stay in use for up to 5 days. The
-  next try waits `keys.min_refresh_secs`. After 5 days, the route replies
-  503.
+- After a failed refresh, the old keys stay in use until they are 5 days old,
+  counted from the last good refresh. The next try waits
+  `keys.min_refresh_secs`. Then the route acks with 503.
 
 A valid JWT is valid for its life plus the skew. The JWT does not cover the
 body. So `allowed_tenants` is as strong as the JWT check, and no stronger.
@@ -155,14 +155,15 @@ rest of the text. `Activity::is_card_submit()` finds a card `Action.Submit`.
 
 Teams waits 5 s for an invoke reply. The plugin waits `invoke_timeout_ms`
 (default 4000, max 4500). If the handler is slower, the plugin sends a
-fallback reply. The handler continues, but Teams does not get its reply. For
+fallback ack. The handler continues, but Teams does not get its reply. For
 slow work, reply at once and send a proactive message later.
 
 | Case | `card_action` (Universal Actions) | Other invokes |
 |---|---|---|
-| No handler | 200, error body with `statusCode` 400 | 501 |
-| Handler error or panic | 200, error body with `statusCode` 500 | 500, empty body |
-| Handler too slow | 200, error body with `statusCode` 500 | 200, empty body |
+| Handler reply | 200, with the handler body | the handler status and body |
+| No handler | 200, error body: `statusCode` 400, `BadRequest` | 501 |
+| Handler error or panic | 200, error body: `statusCode` 500, `InternalServerError` | 500, empty body |
+| Handler too slow | 200, error body: `statusCode` 500, `InternalServerError` | 200, empty body |
 
 Universal Actions need HTTP 200. The error goes in the body
 (`application/vnd.microsoft.error`), with `error_text` as the message. Teams
@@ -223,8 +224,10 @@ App token:
   `botframework.com` for a multi-tenant bot.
 - The cache keeps the token until 5 min before it expires. For a token that
   lives less than 10 min, the margin is half its life.
-- One token request runs at a time. Callers that wait share its result.
-- While a refresh runs, the old token serves if it is not expired.
+- In the margin, the old token serves at once, and a refresh starts in the
+  background. After a failed refresh, the next one waits 30 s.
+- With no valid token, the caller waits for a refresh. One token request
+  runs at a time. Callers that wait share its result, also an error.
 
 Retry rules:
 
@@ -240,7 +243,9 @@ Retry rules:
 `serviceUrl` rules: the client sends the token only to an HTTPS URL whose
 host is in `service_url_hosts` (default `smba.trafficmanager.net`). The URL
 must not have user info, a port, a query, or a fragment. Plain HTTP is
-allowed only on a loopback host, for tests.
+allowed only on a loopback host, for tests. A path segment cannot be empty,
+`.`, or `..`, so a call cannot leave the `serviceUrl` path. The transport
+reads at most 4 MiB of a reply and drops the rest.
 
 ## Config
 
@@ -307,7 +312,7 @@ that hold them. Builder calls (`with_app_id`, `with_app_password`,
   `teams_api_retries_total{operation}`, `teams_token_requests_total{outcome}`,
   `teams_key_refreshes_total{outcome}`, `teams_handlers_in_flight`. Label
   values come from fixed sets in code, never from activity data.
-- **Shutdown:** the route replies 503, so the Connector can send the activity
+- **Shutdown:** the route acks with 503, so the Connector can send the activity
   again. The plugin waits for handlers up to `drain_timeout_secs`.
 
 ## Tests for apps

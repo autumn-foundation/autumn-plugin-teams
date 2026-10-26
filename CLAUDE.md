@@ -40,14 +40,15 @@ verus verus/policy.rs
 - Write the test first. See it fail. Then write the code.
 - A change to `src/policy.rs` needs the same change in `verus/policy.rs`.
   Run Verus. The test `verus_bodies_match` compares the two.
-- Check the JWT before the body is read. Check the activity against the
+- Check the JWT before the plugin reads the body. Check the activity against the
   JWT (endorsement, `serviceUrl`, tenant) before any handler runs.
-- A Universal Action (`adaptiveCard/action`) reply is always HTTP 200. Put
-  the error in the body.
+- A Universal Action (`adaptiveCard/action`) ack is always HTTP 200. Put
+  the error in the invoke reply body.
 - Use these terms: "JWT" for the inbound token, "app token" for the
-  outbound token, "ack" for the HTTP reply to the Connector, "reply" for a
-  message that the bot sends, "refresh" for a key set load.
-- RS256 only. Never let the token header pick the algorithm.
+  outbound token, "ack" for the HTTP answer to the Connector, "invoke reply"
+  for the `InvokeResponse` in an invoke ack, "reply" for a message that the
+  bot sends, "refresh" for a key set load or a new app token request.
+- RS256 only. Never let the JWT header pick the algorithm.
 - Never send the app token to a host that is not in `service_url_hosts`.
 - Never retry a POST after a 5xx or a network error. It can post two times.
   A 401 retry is safe: the Connector did nothing.

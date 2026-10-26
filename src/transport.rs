@@ -162,8 +162,8 @@ pub trait HttpTransport: Send + Sync + 'static {
 /// Largest reply body that [`ReqwestTransport`] reads.
 pub const MAX_REPLY_BYTES: usize = 4 * 1024 * 1024;
 
-/// Real HTTPS transport (`reqwest`, rustls). It follows no redirect and reads
-/// at most [`MAX_REPLY_BYTES`] of a reply.
+/// Real HTTPS transport (`reqwest`, rustls). It follows no redirect. It
+/// reads at most [`MAX_REPLY_BYTES`] of a reply and drops the rest.
 #[derive(Debug, Clone)]
 pub struct ReqwestTransport {
     client: reqwest::Client,
@@ -217,8 +217,12 @@ impl HttpTransport for ReqwestTransport {
                 .await
                 .map_err(|e| TransportError(e.without_url().to_string()))?
             {
-                if body.len() + chunk.len() > MAX_REPLY_BYTES {
-                    return Err(TransportError("reply body is too large".to_owned()));
+                // Cut, not an error: the call itself worked. A network error
+                // here could make the app send a message again.
+                let room = MAX_REPLY_BYTES - body.len();
+                if chunk.len() >= room {
+                    body.extend_from_slice(&chunk[..room]);
+                    break;
                 }
                 body.extend_from_slice(&chunk);
             }

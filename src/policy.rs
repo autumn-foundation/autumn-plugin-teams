@@ -211,6 +211,14 @@ mod tests {
         &src[..src.find("#[cfg(test)]").unwrap()]
     }
 
+    /// The `pub const` lines of a file, without `pub const fn`.
+    fn consts(src: &str) -> Vec<&str> {
+        src.lines()
+            .map(str::trim)
+            .filter(|l| l.starts_with("pub const ") && !l.starts_with("pub const fn"))
+            .collect()
+    }
+
     #[test]
     fn constants_match_the_spec() {
         assert_eq!(DEFAULT_CLOCK_SKEW_SECS, 300);
@@ -219,12 +227,8 @@ mod tests {
         assert_eq!(TOKEN_REFRESH_MARGIN_SECS, 300);
         assert_eq!(MAX_ATTEMPTS, 10);
         assert_eq!(DEFAULT_RETRY_AFTER_MS, 1_000);
-        for line in code()
-            .lines()
-            .filter(|l| l.starts_with("pub const ") && !l.starts_with("pub const fn"))
-        {
-            assert!(SPEC.contains(line), "verus/policy.rs lacks {line}");
-        }
+        let (code, spec) = (consts(code()), consts(SPEC));
+        assert_eq!(code, spec, "the two files have other constants");
     }
 
     /// The balanced `{ ... }` block that starts at byte `open`.
@@ -292,19 +296,56 @@ mod tests {
             .replace("i=i+1;", "i+=1;")
     }
 
+    /// The parameters and the return type of `fn name`, with no whitespace.
+    /// A Verus return binding such as `(r: bool)` becomes `bool`.
+    fn signature(src: &str, name: &str) -> String {
+        let at = src
+            .find(&format!("fn {name}("))
+            .unwrap_or_else(|| panic!("no fn {name}"));
+        let open = at + src[at..].find('(').unwrap();
+        let mut depth = 0;
+        let close = src[open..]
+            .char_indices()
+            .find_map(|(i, c)| {
+                match c {
+                    '(' => depth += 1,
+                    ')' => depth -= 1,
+                    _ => {}
+                }
+                (depth == 0).then_some(open + i)
+            })
+            .unwrap();
+        let tail = &src[close + 1..];
+        let end = ["ensures", "requires", "{"]
+            .iter()
+            .filter_map(|k| tail.find(k))
+            .min()
+            .unwrap();
+        let flat = |t: &str| t.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+        let output = flat(&tail[..end]);
+        let output = output.trim_start_matches("->");
+        let output = match output.split_once(':') {
+            Some((bind, ty)) if bind.starts_with('(') => ty.strip_suffix(')').unwrap_or(ty),
+            _ => output,
+        };
+        format!("{}->{output}", flat(&src[open..=close]).replace(",)", ")"))
+    }
+
+    /// Names of the `pub const fn` items in this file.
+    fn code_fns() -> Vec<String> {
+        code()
+            .lines()
+            .filter_map(|l| l.strip_prefix("pub const fn "))
+            .map(|l| l.split('(').next().unwrap_or_default().to_owned())
+            .collect()
+    }
+
     #[test]
     fn verus_bodies_match() {
-        for name in [
-            "token_time_valid",
-            "token_needs_refresh",
-            "token_margin",
-            "token_expires_at",
-            "keys_fresh",
-            "may_refresh_keys",
-            "backoff_ms",
-            "decide",
-            "retry_after_ms",
-        ] {
+        let names = code_fns();
+        assert_eq!(names.len(), 9, "{names:?}");
+        for name in &names {
+            assert_eq!(signature(SPEC, name), signature(code(), name), "fn {name}");
             assert_eq!(body(SPEC, name), body(code(), name), "fn {name}");
         }
     }
@@ -319,6 +360,16 @@ mod tests {
         );
         let changed = code().replace("i += 1;", "i += 2;");
         assert_ne!(body(&changed, "backoff_ms"), body(SPEC, "backoff_ms"));
+        // The check must see swapped parameters.
+        let changed = code().replace(
+            "keys_fresh(now: u64, fetched_at: u64, max_age: u64)",
+            "keys_fresh(fetched_at: u64, now: u64, max_age: u64)",
+        );
+        assert_ne!(
+            signature(&changed, "keys_fresh"),
+            signature(SPEC, "keys_fresh")
+        );
+        assert_eq!(signature(SPEC, "decide"), signature(code(), "decide"));
     }
 
     #[test]

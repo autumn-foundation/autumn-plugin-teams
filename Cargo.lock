@@ -156,6 +156,7 @@ dependencies = [
  "autumn-plugin-teams",
  "autumn-web",
  "futures",
+ "http-body-util",
  "jsonwebtoken",
  "proptest",
  "reqwest",

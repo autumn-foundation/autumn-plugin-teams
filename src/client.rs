@@ -96,6 +96,10 @@ impl TeamsClient {
         if !allowed_service_url(service_url, &self.inner.config.service_url_hosts) {
             return Err(TeamsError::BadServiceUrl);
         }
+        // A dot segment would move the path out of the `serviceUrl` path.
+        if let Some(bad) = segments.iter().find(|s| matches!(**s, "" | "." | "..")) {
+            return Err(TeamsError::Config(format!("bad path segment {bad:?}")));
+        }
         let mut url = service_url.trim_end_matches('/').to_owned();
         for seg in segments {
             url.push('/');

@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to this project are documented here. The format follows
+This file lists all notable changes to this project. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
@@ -27,9 +27,12 @@ All notable changes to this project are documented here. The format follows
   `Activity::is_card_submit`.
 - Client-credentials app token for single-tenant and multi-tenant bots, with
   a cache and one request at a time. Callers that wait share the result.
-- Verus proves the retry rules: 429 and 412 wait for `Retry-After`, 5xx and
-  network errors retry only for GET, PUT, and DELETE, and a 401 gets one
-  token refresh per call.
-- The key set refreshes in the background while known keys serve. Old keys
-  serve for at most 5 days after a failed refresh.
+- Verus proves the retry decision and a model of the whole retry loop: a
+  rate limit waits for `Retry-After`, 5xx and network errors retry only for
+  idempotent calls, and a 401 gets one app token refresh per call. Tests map
+  412 and 429 to a rate limit, and POST to not idempotent.
+- The key set refreshes in the background while known keys serve. After a
+  failed refresh, old keys serve until they are 5 days old.
+- Dedup of repeat activities, drain at shutdown, a health indicator,
+  Prometheus metrics, and a `serviceUrl` host allowlist for the app token.
 - `testing` feature: `TestAuthority` and inbound activity builders.

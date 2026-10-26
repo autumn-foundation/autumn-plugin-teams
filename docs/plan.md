@@ -53,7 +53,7 @@ Selected scope: items 1 to 8.
 | Use a valid token for a different `serviceUrl`. Send the bot token to an attacker. | Require the `serviceUrl` claim to equal the activity `serviceUrl`. Send the bot token only to HTTPS hosts in `service_url_hosts`. |
 | Accept `alg: none` or HS256 with the public key. | Allow RS256 only. Ignore the token header algorithm list. |
 | An attacker sends many unknown `kid` values. The bot refreshes keys for each. | Refresh keys on an unknown `kid` at most once per `keys.min_refresh_secs`. Proven in the spec (for a clock that does not go back). |
-| Stale keys after a Microsoft key rotation. | Refresh the key set every 24 h or sooner. Old keys serve at most 5 days after a failed refresh. |
+| Stale keys after a Microsoft key rotation. | Refresh the key set every 24 h or sooner. After a failed refresh, old keys serve until they are 5 days old. |
 | A key refresh blocks all requests. | A known `kid` serves from the old set while one background task refreshes. |
 | A tenant that is not ours uses the bot. | Optional `allowed_tenants`. 403 for another tenant. |
 | Miss the 5 s invoke limit. Teams retries two times and shows an error. | Reply to an invoke in `invoke_timeout_ms` (default 4 s, max 4.5 s). Then reply 200 empty. Run other activities after a 200 ack. |
@@ -96,8 +96,8 @@ flowchart LR
   H -->|none| U[200, or 501 for an invoke]
   H -->|invoke| W{done in invoke_timeout_ms?}
   W -->|yes| IR[status + body]
-  W -->|no| L[fallback reply]
-  H -->|other| BG[dedup, then background task] --> A1[200 at once]
+  W -->|no| L[fallback ack]
+  H -->|other| A1[200 at once] --> BG[task: dedup, then handler]
   BG --> CL[TeamsClient]
   CL --> TK[app token: client credentials, cached]
   CL -->|serviceUrl host allowed| API[(Connector REST API)]
@@ -130,7 +130,7 @@ Modules:
 ## 8. Acceptance criteria
 
 - **AC1** `TeamsPlugin` implements `autumn_web::plugin::Plugin`. One call installs it. It declares a contract for autumn-web 0.8 and the `[teams]` config section. It passes the autumn conformance harness.
-- **AC2** The JWT check runs before the body is read. A missing or bad JWT gives 401. No handler runs before the check. The check:
+- **AC2** The JWT check runs before the plugin reads the body. A missing or bad JWT gives 401. No handler runs before the check. The check:
   - `Bearer` scheme, 16 KiB or less.
   - RS256 only.
   - A key from the Bot Framework `OpenID` key set, by `kid`, and a valid signature.
@@ -140,14 +140,14 @@ Modules:
   - The key endorsement holds the activity `channelId`, and the channel is in `allowed_channels`.
   - The `serviceurl` claim equals the activity `serviceUrl`.
   - The tenant is in `allowed_tenants` (when set).
-- **AC4** Keys: the plugin refreshes the key set after `keys.cache_secs` (max 24 h). During the refresh, a known `kid` still serves. An unknown `kid` refreshes the set at most once per `keys.min_refresh_secs`. After a failed refresh, the old keys serve for at most 5 days.
+- **AC4** Keys: the plugin refreshes the key set after `keys.cache_secs` (max 24 h). During the refresh, a known `kid` still serves. An unknown `kid` refreshes the set at most once per `keys.min_refresh_secs`. After a failed refresh, the old keys serve until they are 5 days old, counted from the last good refresh.
 - **AC5** Activities: `message` goes to a command handler by first word (bot mention removed, case-insensitive), else to `on_message`. `conversationUpdate` goes to `on_members_added`, `on_members_removed`, and `on_conversation_update`. Also `messageUpdate`, `messageDelete`, `messageReaction`, `installationUpdate`, and `event` by name. The 200 ack does not wait for the handler. A repeat activity ID per conversation is dropped. Unknown types get 200.
-- **AC6** Invokes: `adaptiveCard/action` goes to a handler by verb, other invokes by name. The handler reply is the HTTP reply when it comes in `invoke_timeout_ms`. A slower handler gives a fallback reply and counts a late ack. A Universal Action reply is always HTTP 200; a failure is an error body (400 for no handler, 500 for an error, a panic, or a late reply). Another invoke gives 501 with no handler, and 500 with an empty body for an error or a panic.
+- **AC6** Invokes: `adaptiveCard/action` goes to a handler by verb, other invokes by name. The handler reply is the HTTP reply when it comes in `invoke_timeout_ms`. A slower handler gives a fallback ack and counts a late ack. A Universal Action ack is always HTTP 200; a failure is an error body (400 for no handler, 500 for an error, a panic, or a late reply). Another invoke gives 501 with no handler, and 500 with an empty body for an error or a panic.
 - **AC7** `TeamsClient` has typed calls: send, reply, update, delete, create conversation, members, paged members (page size 50 to 500), all members (pagination), one member, team details, team channels, and send to a `ConversationReference`. A Connector error gives a typed error with the code. A `TeamsContext` can reply, send, type, update, and delete in the current conversation.
-- **AC8** App token: client credentials to the tenant token endpoint (`botframework.com` for multi-tenant). The token is cached until a margin before it expires (5 min, or half the life of a short token). One token request runs at a time, and waiters share its result. The old token serves during a refresh. A 401 from the Connector gets a new token and one retry.
+- **AC8** App token: client credentials to the tenant token endpoint (`botframework.com` for multi-tenant). The cache keeps the app token until a margin before it expires (5 min, or half the life of a short token). One token request runs at a time, and waiters share its result. The old token serves during a refresh. A 401 from the Connector gets a new token and one retry.
 - **AC9** Retry: 429 and 412 wait for `Retry-After` and retry. A wait over `api.max_wait_ms` stops the call. 5xx and network errors retry with backoff only for GET, PUT, and DELETE. Attempts are bounded.
 - **AC10** The client sends the app token only to an HTTPS URL whose host is in `service_url_hosts` (default `smba.trafficmanager.net`), with no user info, no port, no query, and no fragment. Plain HTTP only on a loopback host, for tests.
-- **AC11** Handler errors and panics do not crash the app. Shutdown makes the route reply 503 and waits for handlers up to `drain_timeout_secs`.
+- **AC11** Handler errors and panics do not crash the app. At shutdown, the route acks with 503 and waits for handlers up to `drain_timeout_secs`.
 - **AC12** A health indicator (app token request, cached, single flight, opt-in readiness). A metrics source with request, handler, API, token, and key counters. Label values come from fixed sets in code.
 - **AC13** Serde config with validation, layered TOML, `AUTUMN_TEAMS__*` env vars, and secrets from named env vars. Startup fails when the app ID or password is missing in a web role, or when CSRF blocks the route.
 - **AC14** `testing::TestAuthority` (feature `testing`) and `MemoryTransport` are public for app tests.

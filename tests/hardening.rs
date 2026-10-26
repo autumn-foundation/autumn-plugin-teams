@@ -446,7 +446,11 @@ async fn a_short_token_keeps_half_its_life() {
     assert_eq!(t.requests_to("/oauth2/v2.0/token").len(), 1);
     clock.advance(Duration::from_secs(50));
     c.check_credentials().await.unwrap();
-    assert_eq!(t.requests_to("/oauth2/v2.0/token").len(), 2);
+    // In the margin: a background refresh.
+    wait_until(Duration::from_secs(5), &|| {
+        t.requests_to("/oauth2/v2.0/token").len() == 2
+    })
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -729,4 +733,94 @@ async fn the_request_url_is_the_parsed_url() {
         connector_requests(&t)[0].url,
         "https://smba.trafficmanager.net/teams/v3"
     );
+}
+
+// ------------------------------------------------------------- round 2
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_refresh_does_not_stall_calls_that_have_a_valid_token() {
+    let t = MemoryTransport::new();
+    let clock = Arc::new(TickingClock::starting_at(now()));
+    let c = plugin(&t)
+        .with_clock(clock.clone())
+        .start(&AppState::for_test())
+        .unwrap()
+        .client();
+    c.check_credentials().await.unwrap();
+    // In the margin, but not expired. The token endpoint is down and slow.
+    clock.advance(Duration::from_secs(3_400));
+    t.respond("/oauth2/v2.0/token", HttpReply::text(503, ""));
+    t.respond("/activities", HttpReply::json(200, &json!({"id": "x"})));
+    for _ in 0..3 {
+        let start = std::time::Instant::now();
+        c.send_to_conversation(SERVICE_URL, "c", &Activity::message("x"))
+            .await
+            .unwrap();
+        assert!(
+            start.elapsed() < Duration::from_millis(80),
+            "{:?}",
+            start.elapsed()
+        );
+        t.set_latency(Duration::from_millis(100));
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        t.set_latency(Duration::ZERO);
+    }
+    // One background refresh (3 attempts) at most, then a wait after the failure.
+    assert!(t.requests_to("/oauth2/v2.0/token").len() <= 4);
+}
+
+#[tokio::test]
+async fn dot_segments_cannot_leave_the_service_path() {
+    let t = MemoryTransport::new();
+    let c = plugin(&t).start(&AppState::for_test()).unwrap().client();
+    for seg in ["..", ".", ""] {
+        let e = c
+            .call(
+                "x",
+                Method::Get,
+                SERVICE_URL,
+                &["v3", seg, "admin"],
+                &[],
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(e, TeamsError::Config(_)), "{seg:?}: {e:?}");
+    }
+    assert!(t.requests().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_repeat_counts_only_as_a_duplicate() {
+    let t = MemoryTransport::new();
+    let (tx, mut rx) = mpsc::unbounded_channel::<()>();
+    let p = plugin(&t).on_message(move |_c, _a| {
+        let tx = tx.clone();
+        async move {
+            tx.send(()).unwrap();
+            Ok(())
+        }
+    });
+    let metrics = p.metrics();
+    let client = app(p);
+    let m = message("x");
+    post(&client, &m).await.assert_status(200);
+    post(&client, &m).await.assert_status(200);
+    recv(&mut rx).await;
+    wait_until(Duration::from_secs(5), &|| {
+        metrics.requests("duplicate") == 1
+    })
+    .await;
+    assert_eq!(metrics.requests("ok"), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_card_action_ack_is_http_200_whatever_the_handler_status() {
+    let t = MemoryTransport::new();
+    let client = app(plugin(&t).card_action("odd", |_c, _a| async {
+        Ok(InvokeResponse::json(403, json!({"statusCode": 403})))
+    }));
+    let r = post(&client, &testing::card_action("odd", json!({}))).await;
+    r.assert_status(200);
+    assert_eq!(r.json::<Value>()["statusCode"], 403);
 }
