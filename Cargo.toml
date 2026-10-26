@@ -1,0 +1,51 @@
+[package]
+name = "autumn-plugin-teams"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88.0"
+description = "Microsoft Teams plugin for autumn-web: verified Bot Framework activities, typed handlers, and a Connector client"
+license = "Apache-2.0"
+repository = "https://github.com/autumn-foundation/autumn-plugin-teams"
+readme = "README.md"
+keywords = ["autumn", "teams", "bot", "botframework", "chatops"]
+categories = ["web-programming", "api-bindings"]
+
+[features]
+# Test helpers: a token authority with a fixed test key. Never use in production.
+testing = []
+
+[dependencies]
+autumn-web = { version = "0.8.0", default-features = false }
+futures = "0.3"
+jsonwebtoken = { version = "11.1", default-features = false, features = ["rust_crypto", "use_pem"] }
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_urlencoded = "0.7"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+toml = "0.9"
+tracing = "0.1"
+url = "2"
+
+[dev-dependencies]
+# Self dependency: tests get the `testing` feature with plain `cargo test`.
+autumn-plugin-teams = { path = ".", features = ["testing"] }
+proptest = "1"
+tower = { version = "0.5", features = ["util"] }
+tokio = { version = "1", features = ["full", "test-util"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+unwrap_used = "warn"
+expect_used = "warn"
+# `pub(crate)` marks crate-internal items on purpose.
+redundant_pub_crate = "allow"
