@@ -15,7 +15,7 @@ categories = ["web-programming", "api-bindings"]
 testing = []
 
 [dependencies]
-autumn-web = { version = "0.8.0", default-features = false }
+autumn-web = { version = "0.9.0", default-features = false }
 futures = "0.3"
 http-body-util = "0.1"
 jsonwebtoken = { version = "11.1", default-features = false, features = ["rust_crypto", "use_pem"] }

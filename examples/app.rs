@@ -96,15 +96,17 @@ async fn notify(state: &AppState, text: &str) -> HandlerResult<()> {
 
 #[autumn_web::main]
 async fn main() {
-    autumn_web::app()
-        .plugin(
-            TeamsPlugin::new()
-                .command("deploy", deploy)
-                .command("subscribe", subscribe)
-                .card_action("approve", approve)
-                .on_members_added(welcome)
-                .on_message(help),
-        )
-        .run()
-        .await;
+    Box::pin(
+        autumn_web::app()
+            .plugin(
+                TeamsPlugin::new()
+                    .command("deploy", deploy)
+                    .command("subscribe", subscribe)
+                    .card_action("approve", approve)
+                    .on_members_added(welcome)
+                    .on_message(help),
+            )
+            .run(),
+    )
+    .await;
 }

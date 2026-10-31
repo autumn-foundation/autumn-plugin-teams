@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-Microsoft Teams plugin for autumn-web 0.8. Style for all docs and comments:
+Microsoft Teams plugin for autumn-web 0.9. Style for all docs and comments:
 ASD-STE100. Short sentences, active voice, simple present tense.
 
 ## Layout
@@ -63,5 +63,5 @@ verus verus/policy.rs
 - A test that needs env vars runs a child process. See `tests/boot.rs`.
 - Delivery is at least once. Do not claim exactly once.
 - Do not log bodies, tokens, or secrets.
-- Ground autumn API questions in the autumn-web 0.8 sources or the autumn
+- Ground autumn API questions in the autumn-web 0.9 sources or the autumn
   docs MCP, never memory.

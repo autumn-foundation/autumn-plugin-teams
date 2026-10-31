@@ -1,6 +1,6 @@
 # autumn-plugin-teams
 
-Microsoft Teams plugin for [autumn-web](https://autumn-web.app) 0.8.
+Microsoft Teams plugin for [autumn-web](https://autumn-web.app) 0.9.
 
 - A Bot Framework route. It checks the Connector JWT before it reads the
   body.
