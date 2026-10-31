@@ -15,7 +15,7 @@ Microsoft Teams plugin for [autumn-web](https://autumn-web.app) 0.9.
 
 ```toml
 [dependencies]
-autumn-plugin-teams = "0.1"
+autumn-plugin-teams = "0.2"
 ```
 
 ```rust,ignore
@@ -321,7 +321,7 @@ Enable the `testing` feature in `dev-dependencies`:
 
 ```toml
 [dev-dependencies]
-autumn-plugin-teams = { version = "0.1", features = ["testing"] }
+autumn-plugin-teams = { version = "0.2", features = ["testing"] }
 ```
 
 ```rust,ignore
