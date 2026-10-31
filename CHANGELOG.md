@@ -5,6 +5,10 @@ This file lists all notable changes to this project. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- Support `autumn-web` 0.9. The plugin now needs `autumn-web` 0.9.
+
 ### Added
 
 - `TeamsPlugin`: one-line install for autumn-web 0.8. It mounts
