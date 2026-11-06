@@ -18,7 +18,7 @@ Microsoft Teams plugin for [autumn-web](https://autumn-web.app) 0.10.
 autumn-plugin-teams = "0.3"
 ```
 
-```rust,ignore
+```rust,no_run
 use autumn_plugin_teams::activity::{Activity, InvokeResponse};
 use autumn_plugin_teams::{HandlerResult, TeamsContext, TeamsPlugin};
 
@@ -187,10 +187,16 @@ task, so the ack does not wait for it. If the store fails, or takes more than
 The default store is in memory, for one process. For many replicas, use a
 shared store:
 
-```rust,ignore
-use autumn_web::webhook::{RedisWebhookReplayStore, WebhookReplayRedisConfig};
+```rust
+use std::sync::Arc;
+use autumn_plugin_teams::TeamsPlugin;
+use autumn_web::webhook::WebhookReplayStore;
 
-TeamsPlugin::new().with_replay_store(Arc::new(RedisWebhookReplayStore::from_config(&redis)?))
+// For example `RedisWebhookReplayStore::from_config(&redis)?`, with the
+// autumn-web `redis` feature.
+fn plugin(shared: Arc<dyn WebhookReplayStore>) -> TeamsPlugin {
+    TeamsPlugin::new().with_replay_store(shared)
+}
 ```
 
 A restart stops background handlers. Use a `#[job]` for work that must
@@ -198,9 +204,18 @@ continue after a restart.
 
 ## Connector client
 
-```rust,ignore
-let client = TeamsClient::from_state(&state).expect("teams plugin installed");
-client.send_to(&stored_reference, &Activity::message("Build done")).await?;
+```rust,no_run
+use autumn_plugin_teams::activity::{Activity, ConversationReference};
+use autumn_plugin_teams::{TeamsClient, TeamsError};
+use autumn_web::AppState;
+
+async fn notify(state: &AppState, stored_reference: &ConversationReference) -> Result<(), TeamsError> {
+    let Some(client) = TeamsClient::from_state(state) else {
+        return Ok(()); // The plugin is not installed.
+    };
+    client.send_to(stored_reference, &Activity::message("Build done")).await?;
+    Ok(())
+}
 ```
 
 | Method | Connector call |
@@ -324,32 +339,41 @@ Enable the `testing` feature in `dev-dependencies`:
 autumn-plugin-teams = { version = "0.3", features = ["testing"] }
 ```
 
-```rust,ignore
+```rust,no_run
+use autumn_plugin_teams::activity::Activity;
 use autumn_plugin_teams::testing::{self, TestAuthority};
 use autumn_plugin_teams::transport::MemoryTransport;
-use autumn_plugin_teams::{TeamsConfig, TeamsPlugin};
+use autumn_plugin_teams::{HandlerResult, TeamsConfig, TeamsContext, TeamsPlugin};
 use autumn_web::reexports::chrono::Utc;
 
-let authority = TestAuthority::new(testing::APP_ID);
-let transport = MemoryTransport::new();
-let plugin = TeamsPlugin::with_config(TeamsConfig::default())
-    .with_app_id(testing::APP_ID)
-    .with_app_password("test")
-    .with_key_source(authority.key_source())
-    .with_transport(transport.clone())
-    .command("deploy", deploy);
-let client = autumn_web::test::TestApp::new().plugin(plugin).build();
-let activity = testing::message("deploy prod");
-let now = u64::try_from(Utc::now().timestamp()).unwrap();
-client
-    .post("/teams/messages")
-    .header("authorization", &authority.bearer(&activity, now))
-    .body(serde_json::to_string(&activity).unwrap())
-    .send()
-    .await
-    .assert_status(200);
-// The handler runs in the background. Then `transport.requests()` holds
-// the replies that it sent.
+async fn deploy(_ctx: TeamsContext, _a: Activity) -> HandlerResult<()> {
+    Ok(())
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let authority = TestAuthority::new(testing::APP_ID);
+    let transport = MemoryTransport::new();
+    let plugin = TeamsPlugin::with_config(TeamsConfig::default())
+        .with_app_id(testing::APP_ID)
+        .with_app_password("test")
+        .with_key_source(authority.key_source())
+        .with_transport(transport.clone())
+        .command("deploy", deploy);
+    let client = autumn_web::test::TestApp::new().plugin(plugin).build();
+    let activity = testing::message("deploy prod");
+    let now = u64::try_from(Utc::now().timestamp())?;
+    client
+        .post("/teams/messages")
+        .header("authorization", &authority.bearer(&activity, now))
+        .body(serde_json::to_string(&activity)?)
+        .send()
+        .await
+        .assert_status(200);
+    // The handler runs in the background. Then `transport.requests()` holds
+    // the replies that it sent.
+    Ok(())
+}
 ```
 
 Never trust the test key in production. Anyone can sign with it.

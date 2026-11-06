@@ -33,3 +33,8 @@ pub use handlers::TeamsContext;
 pub use health::TeamsHealth;
 pub use metrics::TeamsMetrics;
 pub use plugin::{DEFAULT_BASE_PATH, PLUGIN_NAME, TeamsPlugin, TeamsRuntime};
+
+/// Compiles the Rust snippets of the README as doctests.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+pub struct ReadmeDoctests;
