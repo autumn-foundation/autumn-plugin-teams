@@ -13,7 +13,7 @@ use autumn_web::plugin_contract::PluginContract;
 use autumn_web::reexports::axum::Router;
 use autumn_web::time::{ClockSource, SystemClock};
 use autumn_web::webhook::{InMemoryWebhookReplayStore, WebhookReplayStore};
-use autumn_web::{AppState, AutumnError, ProcessRole};
+use autumn_web::{AppState, AutumnError, Role};
 use tokio_util::task::TaskTracker;
 
 use crate::activity::{Activity, InvokeResponse};
@@ -331,29 +331,31 @@ impl TeamsPlugin {
     /// # Errors
     /// Returns a config error.
     pub fn start(self, state: &AppState) -> Result<TeamsRuntime, TeamsError> {
-        let role = state.role();
+        let role = state.role().clone();
         self.start_with_role(state, role)
     }
 
     /// Starts the plugin as if the process has `role`. A role that serves no
-    /// HTTP (`worker`) needs no app ID check and no CSRF exemption.
+    /// HTTP (`worker`, or a preset without HTTP) needs no app ID check and no
+    /// CSRF exemption. A [`ProcessRole`](autumn_web::ProcessRole) converts
+    /// into a [`Role`].
     ///
     /// # Errors
     /// Same as [`Self::start`].
     pub fn start_with_role(
         self,
         state: &AppState,
-        role: ProcessRole,
+        role: impl Into<Role>,
     ) -> Result<TeamsRuntime, TeamsError> {
         let health = Arc::new(TeamsHealth::new(self.readiness));
-        self.start_inner(state, role, health)
+        self.start_inner(state, &role.into(), health)
     }
 
     #[allow(clippy::too_many_lines)] // One linear setup sequence.
     fn start_inner(
         self,
         state: &AppState,
-        role: ProcessRole,
+        role: &Role,
         health: Arc<TeamsHealth>,
     ) -> Result<TeamsRuntime, TeamsError> {
         let config = match self.config {
@@ -604,7 +606,7 @@ impl Plugin for TeamsPlugin {
         Some(
             PluginContract::new(env!("CARGO_PKG_NAME"))
                 .plugin_version(env!("CARGO_PKG_VERSION"))
-                .autumn_web("0.9"),
+                .autumn_web("0.10"),
         )
     }
 
