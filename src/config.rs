@@ -444,7 +444,7 @@ pub(crate) fn valid_url(url: &str) -> bool {
 }
 
 /// Returns `true` for `localhost` and loopback IP hosts.
-pub(crate) fn is_loopback(host: Option<&url::Host<&str>>) -> bool {
+pub(crate) const fn is_loopback(host: Option<&url::Host<&str>>) -> bool {
     match host {
         Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
         Some(url::Host::Ipv4(ip)) => ip.is_loopback(),

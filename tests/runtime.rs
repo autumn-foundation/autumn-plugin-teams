@@ -101,7 +101,7 @@ fn plugin_name_contract_and_conformance() {
     assert_eq!(p.name(), "autumn-plugin-teams");
     assert!(format!("{p:?}").contains("TeamsPlugin"));
     let contract = p.contract().unwrap();
-    assert!(format!("{contract:?}").contains("0.9"), "{contract:?}");
+    assert!(format!("{contract:?}").contains("0.10"), "{contract:?}");
     let app = autumn_web::app().plugin(TeamsPlugin::default());
     assert!(app.has_plugin("autumn-plugin-teams"));
     assert!(app.has_config_section("teams"));
@@ -253,7 +253,7 @@ async fn keys_are_cached_and_refreshed_after_the_max_age() {
         assert_eq!(send(&rt, &a).await, 200);
     }
     assert_eq!(keys.loads.load(Ordering::SeqCst), 1);
-    clock.advance(Duration::from_secs(86_400));
+    clock.advance(Duration::from_hours(24));
     a.id = Some("k-late".into());
     let at = now_secs() + 86_400;
     // A stale set still serves a known kid. One refresh runs in the background.
@@ -309,7 +309,7 @@ async fn failed_refresh_keeps_the_old_keys() {
     a.id = Some("1".into());
     assert_eq!(send(&rt, &a).await, 200);
     keys.fail.store(true, Ordering::SeqCst);
-    clock.advance(Duration::from_secs(86_400));
+    clock.advance(Duration::from_hours(24));
     a.id = Some("2".into());
     assert_eq!(
         send_as(&rt, &authority(), &a, now_secs() + 86_400).await,
