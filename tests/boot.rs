@@ -102,7 +102,7 @@ async fn teams_only_app_boots_and_checks_tokens() {
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
     let url = format!("http://127.0.0.1:{port}/teams/messages");
     let send = |who: &TestAuthority| {
-        let now = u64::try_from(autumn_web::reexports::chrono::Utc::now().timestamp()).unwrap();
+        let now = u64::try_from(autumn_web::time::Timestamp::now().as_second()).unwrap();
         client
             .post(&url)
             .header("authorization", who.bearer(&activity, now))
@@ -122,7 +122,7 @@ async fn teams_only_app_boots_and_checks_tokens() {
             panic!("the app stopped at boot ({status}):\n{err}");
         }
         assert!(
-            start.elapsed() < Duration::from_secs(60),
+            start.elapsed() < Duration::from_mins(1),
             "the app did not answer"
         );
         if let Ok(res) = send(&good).await {

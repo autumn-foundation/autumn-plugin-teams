@@ -1,6 +1,6 @@
 # autumn-plugin-teams
 
-Microsoft Teams plugin for [autumn-web](https://autumn-web.app) 0.10.
+Microsoft Teams plugin for [autumn-web](https://autumn-web.app) 0.11.
 
 - A Bot Framework route. It checks the Connector JWT before it reads the
   body.
@@ -15,7 +15,7 @@ Microsoft Teams plugin for [autumn-web](https://autumn-web.app) 0.10.
 
 ```toml
 [dependencies]
-autumn-plugin-teams = "0.3"
+autumn-plugin-teams = "0.4"
 ```
 
 ```rust,no_run
@@ -336,7 +336,7 @@ Enable the `testing` feature in `dev-dependencies`:
 
 ```toml
 [dev-dependencies]
-autumn-plugin-teams = { version = "0.3", features = ["testing"] }
+autumn-plugin-teams = { version = "0.4", features = ["testing"] }
 ```
 
 ```rust,no_run
@@ -344,7 +344,7 @@ use autumn_plugin_teams::activity::Activity;
 use autumn_plugin_teams::testing::{self, TestAuthority};
 use autumn_plugin_teams::transport::MemoryTransport;
 use autumn_plugin_teams::{HandlerResult, TeamsConfig, TeamsContext, TeamsPlugin};
-use autumn_web::reexports::chrono::Utc;
+use autumn_web::time::Timestamp;
 
 async fn deploy(_ctx: TeamsContext, _a: Activity) -> HandlerResult<()> {
     Ok(())
@@ -362,7 +362,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .command("deploy", deploy);
     let client = autumn_web::test::TestApp::new().plugin(plugin).build();
     let activity = testing::message("deploy prod");
-    let now = u64::try_from(Utc::now().timestamp())?;
+    let now = u64::try_from(Timestamp::now().as_second())?;
     client
         .post("/teams/messages")
         .header("authorization", &authority.bearer(&activity, now))
