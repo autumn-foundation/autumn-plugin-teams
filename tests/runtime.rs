@@ -101,7 +101,7 @@ fn plugin_name_contract_and_conformance() {
     assert_eq!(p.name(), "autumn-plugin-teams");
     assert!(format!("{p:?}").contains("TeamsPlugin"));
     let contract = p.contract().unwrap();
-    assert!(format!("{contract:?}").contains("0.10"), "{contract:?}");
+    assert!(format!("{contract:?}").contains("0.11"), "{contract:?}");
     let app = autumn_web::app().plugin(TeamsPlugin::default());
     assert!(app.has_plugin("autumn-plugin-teams"));
     assert!(app.has_config_section("teams"));

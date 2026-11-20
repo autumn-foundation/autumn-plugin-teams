@@ -606,7 +606,7 @@ impl Plugin for TeamsPlugin {
         Some(
             PluginContract::new(env!("CARGO_PKG_NAME"))
                 .plugin_version(env!("CARGO_PKG_VERSION"))
-                .autumn_web("0.10"),
+                .autumn_web("0.11"),
         )
     }
 
@@ -686,7 +686,7 @@ mod tests {
             .on_message(|_c, _a| async { Ok(()) })
             .start(&AppState::for_test())
             .unwrap();
-        let now = u64::try_from(autumn_web::reexports::chrono::Utc::now().timestamp()).unwrap();
+        let now = u64::try_from(autumn_web::time::Timestamp::now().as_second()).unwrap();
         let activity = crate::testing::message("x");
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -712,7 +712,7 @@ mod tests {
             .with_key_source(authority.key_source())
             .start(&AppState::for_test())
             .unwrap();
-        let now = u64::try_from(autumn_web::reexports::chrono::Utc::now().timestamp()).unwrap();
+        let now = u64::try_from(autumn_web::time::Timestamp::now().as_second()).unwrap();
         let mut headers = HeaderMap::new();
         headers.insert(
             "authorization",

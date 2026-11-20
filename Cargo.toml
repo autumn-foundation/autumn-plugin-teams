@@ -1,6 +1,6 @@
 [package]
 name = "autumn-plugin-teams"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.97.0"
 description = "Microsoft Teams plugin for autumn-web: verified Bot Framework activities, typed handlers, and a Connector client"
@@ -15,7 +15,7 @@ categories = ["web-programming", "api-bindings"]
 testing = []
 
 [dependencies]
-autumn-web = { version = "0.10.0", default-features = false }
+autumn-web = { version = "0.11.0", default-features = false }
 futures = "0.3"
 http-body-util = "0.1"
 jsonwebtoken = { version = "11.1", default-features = false, features = ["rust_crypto", "use_pem"] }
@@ -33,6 +33,7 @@ tracing = "0.1"
 url = "2"
 
 [dev-dependencies]
+autumn-web = { version = "0.11.0", default-features = false, features = ["plugin-conformance"] }
 # Self dependency: tests get the `testing` feature with plain `cargo test`.
 autumn-plugin-teams = { path = ".", features = ["testing"] }
 proptest = "1"

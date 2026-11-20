@@ -10,7 +10,6 @@ use autumn_plugin_teams::activity::Activity;
 use autumn_plugin_teams::config::TeamsConfig;
 use autumn_plugin_teams::testing::{self, TestAuthority};
 use autumn_plugin_teams::transport::MemoryTransport;
-use autumn_web::reexports::chrono::{DateTime, TimeZone, Utc};
 use autumn_web::test::{TestClient, TestResponse};
 use autumn_web::time::FixedClock;
 
@@ -21,12 +20,12 @@ pub const PASSWORD: &str = "test-app-password-000";
 pub const PATH: &str = "/teams/messages";
 
 /// Fixed test time: 2026-01-01T00:00:00Z.
-pub fn now() -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap()
+pub fn now() -> autumn_web::time::Timestamp {
+    "2026-01-01T00:00:00Z".parse().unwrap()
 }
 
 pub fn now_secs() -> u64 {
-    u64::try_from(now().timestamp()).unwrap()
+    u64::try_from(now().as_second()).unwrap()
 }
 
 pub fn authority() -> TestAuthority {
